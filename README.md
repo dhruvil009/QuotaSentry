@@ -87,3 +87,11 @@ Run autonomous E2E tests:
 ```
 
 The autonomous harness runs one live `codexbar` smoke poll, then uses synthetic `codexbar` binaries for quota-edge scenarios. It writes a report under `.quota-sentry-runs/`.
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for development workflow, test expectations, and hook-safety guidance.
+
+## License
+
+Apache License 2.0. See [LICENSE](./LICENSE).

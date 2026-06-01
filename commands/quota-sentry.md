@@ -56,4 +56,4 @@ After hook installation, tell the user to restart Codex if the current session d
 ./scripts/autonomous-test
 ```
 
-`guard` should stay quiet in hooks. Use `./scripts/quota-sentry guard --verbose` only for manual debugging.
+`guard` should keep stdout/stderr quiet in hooks. It writes one wait notice directly to the controlling terminal when waiting starts. Use `./scripts/quota-sentry guard --verbose` only for manual debugging.

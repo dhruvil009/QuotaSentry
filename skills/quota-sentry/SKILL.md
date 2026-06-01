@@ -37,7 +37,7 @@ Use `install-hook` to merge global hooks into `~/.codex/hooks.json`. Restart Cod
 
 Use `./scripts/autonomous-test` for the E2E harness. It performs one live `codexbar` smoke poll and uses fake `codexbar` binaries for quota-edge scenarios so it does not burn quota through repeated real prompts.
 
-`guard` is quiet by default to avoid flooding Codex hook context after long waits. Use `guard --verbose` only for manual debugging.
+`guard` keeps stdout/stderr quiet by default to avoid flooding Codex hook context after long waits. It still writes one wait notice directly to the controlling terminal when waiting starts. Use `guard --verbose` only for manual debugging, and `guard --no-notify` to suppress the terminal notice.
 
 ## Bypass
 

@@ -24,7 +24,13 @@ Run from this plugin root:
 ./scripts/quota-sentry stop
 ```
 
-`guard` is quiet by default because Codex surfaces hook output back into the TUI after long waits. Use `./scripts/quota-sentry guard --verbose` only when running it manually and you want a single wait message.
+`guard` keeps stdout/stderr quiet by default because Codex surfaces hook output back into the TUI after long waits. When it starts waiting, it writes one notice directly to the controlling terminal instead:
+
+```text
+Quota Sentry: waiting for Codex quota reset until <timestamp>.
+```
+
+Use `./scripts/quota-sentry guard --verbose` only when running it manually and you want a captured wait message too. Use `--no-notify` to suppress the terminal notice.
 
 Install global Codex hooks:
 

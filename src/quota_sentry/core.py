@@ -69,6 +69,23 @@ def default_log_path(state_dir: Optional[Path] = None) -> Path:
     return (state_dir or cache_dir()) / "quota-sentry.log"
 
 
+def emit_terminal_notice(message: str) -> None:
+    notice_file = os.environ.get("QUOTA_SENTRY_NOTICE_FILE")
+    if notice_file:
+        path = Path(notice_file).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
+            handle.write(message + "\n")
+        return
+
+    try:
+        with open("/dev/tty", "w") as tty:
+            tty.write("\n" + message + "\n")
+            tty.flush()
+    except OSError:
+        return
+
+
 def _codex_entry(payload: Any) -> Optional[Dict[str, Any]]:
     entries = payload if isinstance(payload, list) else [payload]
     for entry in entries:
@@ -276,11 +293,14 @@ def wait_if_blocked(
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
     output: Callable[[str], None] = print,
     verbose: bool = False,
+    notice: Callable[[str], None] = emit_terminal_notice,
+    notify: bool = True,
 ) -> int:
     if os.environ.get("QUOTA_SENTRY_DISABLE") == "1":
         return 0
 
     emitted_wait_message = False
+    emitted_notice = False
     while True:
         state = read_state(state_path)
         current_time = now_func()
@@ -301,6 +321,9 @@ def wait_if_blocked(
             return 0
 
         seconds = max(1, min(poll_interval_seconds, int((block_until - current_time).total_seconds())))
+        if notify and not emitted_notice:
+            notice(f"Quota Sentry: waiting for Codex quota reset until {format_timestamp(block_until)}.")
+            emitted_notice = True
         if verbose and not emitted_wait_message:
             output(f"Quota Sentry: Codex quota guard active until {format_timestamp(block_until)}.")
             emitted_wait_message = True

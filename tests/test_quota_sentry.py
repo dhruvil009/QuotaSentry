@@ -181,6 +181,40 @@ class StateTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(messages, [])
 
+    def test_wait_if_blocked_emits_single_wait_notice_without_stdout(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "2026-06-01T16:30:00Z",
+            "blockedUntil": "2026-06-01T16:31:01Z",
+        }
+        current = {"value": datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc)}
+        stdout_messages = []
+        notices = []
+
+        def sleeper(seconds):
+            current["value"] = current["value"] + timedelta(seconds=seconds)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps(state))
+
+            result = core.wait_if_blocked(
+                state_path,
+                poller=lambda: self.fail("poller should not be called for fresh blocked state"),
+                sleeper=sleeper,
+                now_func=lambda: current["value"],
+                poll_interval_seconds=30,
+                output=stdout_messages.append,
+                notice=notices.append,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout_messages, [])
+        self.assertEqual(
+            notices,
+            ["Quota Sentry: waiting for Codex quota reset until 2026-06-01T16:31:01Z."],
+        )
+
     def test_wait_if_blocked_can_emit_single_verbose_message(self):
         state = {
             "status": "blocked",

@@ -239,6 +239,7 @@ print(json.dumps(payload))
             timeout=8,
         )
         quiet_state_dir = self.run_dir / "blocked-guard-quiet"
+        notice_file = self.run_dir / "blocked-guard-notice.log"
         self.run(
             result,
             [
@@ -251,6 +252,8 @@ print(json.dumps(payload))
             ],
             env=self.env("blocked-short"),
         )
+        quiet_env = self.env("open")
+        quiet_env["QUOTA_SENTRY_NOTICE_FILE"] = str(notice_file)
         quiet_result = self.run(
             result,
             [
@@ -263,19 +266,24 @@ print(json.dumps(payload))
                 "--max-state-age-seconds",
                 "30",
             ],
-            env=self.env("open"),
+            env=quiet_env,
             timeout=8,
         )
         if quiet_result.stdout.strip() or quiet_result.stderr.strip():
             raise AutonomousTestError(
                 f"quiet guard emitted hook output: stdout={quiet_result.stdout!r} stderr={quiet_result.stderr!r}"
             )
+        notice_text = notice_file.read_text() if notice_file.exists() else ""
+        if "waiting for Codex quota reset until" not in notice_text:
+            raise AutonomousTestError(f"quiet guard did not write terminal notice side channel: {notice_text!r}")
         elapsed = time.monotonic() - started
         if elapsed < 1:
             raise AutonomousTestError(f"guard returned too quickly for a blocked state: {elapsed:.2f}s")
         if elapsed > 12:
             raise AutonomousTestError(f"guard took too long for short blocked state: {elapsed:.2f}s")
-        result.notes.append(f"Guard waited {elapsed:.2f}s for synthetic resets and quiet mode emitted no output.")
+        result.notes.append(
+            f"Guard waited {elapsed:.2f}s for synthetic resets, quiet mode emitted no hook output, and notice side channel fired."
+        )
 
     def scenario_daemon_lifecycle(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "daemon"

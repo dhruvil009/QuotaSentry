@@ -191,6 +191,7 @@ def guard_command(args: argparse.Namespace) -> int:
         max_state_age_seconds=args.max_state_age_seconds,
         poll_interval_seconds=args.interval_seconds,
         verbose=args.verbose,
+        notify=not args.no_notify,
     )
 
 
@@ -240,6 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
     guard_parser.add_argument("--interval-seconds", type=int, default=core.DEFAULT_POLL_INTERVAL_SECONDS)
     guard_parser.add_argument("--max-state-age-seconds", type=int, default=core.DEFAULT_MAX_STATE_AGE_SECONDS)
     guard_parser.add_argument("--verbose", action="store_true")
+    guard_parser.add_argument("--no-notify", action="store_true")
     guard_parser.set_defaults(func=guard_command)
 
     install_parser = subparsers.add_parser("install-hook", parents=[common])

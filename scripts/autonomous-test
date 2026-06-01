@@ -51,9 +51,10 @@ class AutonomousTestError(Exception):
 
 
 class Harness:
-    def __init__(self, run_dir: Path, skip_live: bool):
+    def __init__(self, run_dir: Path, skip_live: bool, require_global_hook: bool):
         self.run_dir = run_dir
         self.skip_live = skip_live
+        self.require_global_hook = require_global_hook
         self.results: List[ScenarioResult] = []
         self.fake_bin = run_dir / "fake-bin"
         self.fake_bin.mkdir(parents=True, exist_ok=True)
@@ -359,11 +360,19 @@ print(json.dumps(payload))
     def scenario_global_hook_config(self, result: ScenarioResult) -> None:
         hooks_path = Path.home() / ".codex" / "hooks.json"
         if not hooks_path.exists():
+            if not self.require_global_hook:
+                result.status = "SKIP"
+                result.notes.append(f"Global Codex hooks file does not exist: {hooks_path}")
+                return
             raise AutonomousTestError(f"global Codex hooks file does not exist: {hooks_path}")
         payload = json.loads(hooks_path.read_text())
         serialized = json.dumps(payload)
         expected = str(QUOTA_SENTRY)
         if expected not in serialized:
+            if not self.require_global_hook:
+                result.status = "SKIP"
+                result.notes.append(f"Global hooks do not reference this checkout: {expected}")
+                return
             raise AutonomousTestError(f"global hooks do not reference {expected}")
         for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
             if event_name not in payload.get("hooks", {}):
@@ -453,6 +462,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Quota Sentry autonomous E2E tests.")
     parser.add_argument("--list", action="store_true", help="List scenarios without running them.")
     parser.add_argument("--skip-live", action="store_true", help="Skip the real codexbar smoke scenario.")
+    parser.add_argument("--require-global-hook", action="store_true", help="Fail if ~/.codex/hooks.json does not reference this checkout.")
     parser.add_argument("--run-dir", default=None, help="Directory for test artifacts.")
     parser.add_argument("--cleanup", action="store_true", help="Remove run artifacts after a successful run.")
     return parser.parse_args()
@@ -476,7 +486,7 @@ def main() -> int:
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True)
 
-    harness = Harness(run_dir=run_dir, skip_live=args.skip_live)
+    harness = Harness(run_dir=run_dir, skip_live=args.skip_live, require_global_hook=args.require_global_hook)
     harness.run_all()
     report_path = harness.write_report()
 

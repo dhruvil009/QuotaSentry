@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -94,6 +95,18 @@ class ParseCodexbarUsageTest(unittest.TestCase):
         self.assertTrue(decision.fail_open)
         self.assertIn("cookie access denied", decision.reason)
 
+    def test_invalid_reset_timestamp_fails_open(self):
+        decision = core.parse_codexbar_usage(
+            codexbar_payload(used_percent=99, resets_at="not-a-date"),
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.status, "unknown")
+        self.assertTrue(decision.fail_open)
+        self.assertIn("invalid resetsAt", decision.reason)
+
     def test_prefers_the_five_hour_window_even_if_it_is_not_primary(self):
         payload = codexbar_payload(used_percent=12)
         payload[0]["usage"]["primary"]["windowMinutes"] = 10080
@@ -152,6 +165,30 @@ class StateTest(unittest.TestCase):
         block_until = core.block_until_from_state(state, now=NOW, max_state_age_seconds=120)
 
         self.assertIsNone(block_until)
+
+    def test_should_not_block_from_invalid_state_timestamp(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "not-a-date",
+            "blockedUntil": "2026-06-01T21:24:05Z",
+        }
+
+        block_until = core.block_until_from_state(state, now=NOW, max_state_age_seconds=120)
+
+        self.assertIsNone(block_until)
+
+    def test_terminal_notice_file_errors_are_ignored(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory_path = Path(temp_dir)
+            old_value = os.environ.get("QUOTA_SENTRY_NOTICE_FILE")
+            os.environ["QUOTA_SENTRY_NOTICE_FILE"] = str(directory_path)
+            try:
+                core.emit_terminal_notice("test")
+            finally:
+                if old_value is None:
+                    os.environ.pop("QUOTA_SENTRY_NOTICE_FILE", None)
+                else:
+                    os.environ["QUOTA_SENTRY_NOTICE_FILE"] = old_value
 
     def test_wait_if_blocked_is_quiet_by_default(self):
         state = {

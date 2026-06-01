@@ -38,7 +38,10 @@ def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     normalized = value.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(normalized)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
@@ -72,10 +75,13 @@ def default_log_path(state_dir: Optional[Path] = None) -> Path:
 def emit_terminal_notice(message: str) -> None:
     notice_file = os.environ.get("QUOTA_SENTRY_NOTICE_FILE")
     if notice_file:
-        path = Path(notice_file).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
-            handle.write(message + "\n")
+        try:
+            path = Path(notice_file).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as handle:
+                handle.write(message + "\n")
+        except OSError:
+            return
         return
 
     try:
@@ -144,7 +150,7 @@ def parse_codexbar_usage(
     if used_percent is None:
         return QuotaDecision(status="unknown", reason="quota window is missing usedPercent")
     if resets_at is None:
-        return QuotaDecision(status="unknown", reason="quota window is missing resetsAt")
+        return QuotaDecision(status="unknown", reason="quota window has missing or invalid resetsAt")
 
     try:
         used = int(used_percent)

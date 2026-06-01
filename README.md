@@ -1,16 +1,18 @@
 # Quota Sentry
 
-Quota Sentry is a local Codex plugin/helper that watches the Codex 5-hour usage window via `codexbar` and blocks future Codex lifecycle activity once the configured threshold is reached.
+Quota Sentry is a local quota guard for agent harnesses. Version `v0.1.0` supports Codex by watching the Codex 5-hour usage window via `codexbar` and blocking future Codex lifecycle activity once the configured threshold is reached.
 
 ## Current Scope
 
-- Codex only.
+- Codex only in `v0.1.0`; additional harness adapters are welcome.
 - Uses `codexbar usage --provider codex --source cli --format json`.
 - Monitors the 5-hour window (`windowMinutes: 300`) by default.
 - Blocks at `usedPercent >= 95` until `resetsAt` plus a 60-second buffer.
 - Fails open when `codexbar` is missing, quota JSON is unavailable, or state is stale.
 
 The background daemon does not interrupt an already-running model request. It polls every minute and writes state; the synchronous `guard` command is what sleeps when invoked from a Codex hook or wrapper.
+
+Quota Sentry is intentionally conservative for public use: missing tools, malformed quota data, stale state, and unknown quota windows fail open instead of blocking the user.
 
 ## Commands
 
@@ -88,9 +90,11 @@ Run autonomous E2E tests:
 
 The autonomous harness runs one live `codexbar` smoke poll, then uses synthetic `codexbar` binaries for quota-edge scenarios. It writes a report under `.quota-sentry-runs/`.
 
+For clean clones without installed Codex hooks, the global hook scenario is skipped by default. Use `./scripts/autonomous-test --skip-live --require-global-hook` when you specifically need to verify that this checkout is installed in `~/.codex/hooks.json`.
+
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for development workflow, test expectations, and hook-safety guidance.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for development workflow, test expectations, hook-safety guidance, AI-generated code expectations, and guidance for adding other harnesses such as Claude Code or OpenCode.
 
 ## License
 

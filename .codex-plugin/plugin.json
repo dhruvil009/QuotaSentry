@@ -5,6 +5,7 @@
   "author": {
     "name": "Local developer"
   },
+  "license": "Apache-2.0",
   "skills": "./skills/",
   "interface": {
     "displayName": "Quota Sentry",

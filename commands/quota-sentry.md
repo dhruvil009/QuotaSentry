@@ -49,3 +49,11 @@ command -v codexbar
 ```
 
 After hook installation, tell the user to restart Codex if the current session does not pick up the new global hooks.
+
+7. If the user asks to run autonomous tests, run:
+
+```bash
+./scripts/autonomous-test
+```
+
+`guard` should stay quiet in hooks. Use `./scripts/quota-sentry guard --verbose` only for manual debugging.

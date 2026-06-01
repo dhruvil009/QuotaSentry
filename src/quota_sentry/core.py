@@ -275,13 +275,21 @@ def wait_if_blocked(
     max_state_age_seconds: int = DEFAULT_MAX_STATE_AGE_SECONDS,
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
     output: Callable[[str], None] = print,
+    verbose: bool = False,
 ) -> int:
     if os.environ.get("QUOTA_SENTRY_DISABLE") == "1":
         return 0
 
+    emitted_wait_message = False
     while True:
         state = read_state(state_path)
-        block_until = block_until_from_state(state, now=now_func(), max_state_age_seconds=max_state_age_seconds)
+        current_time = now_func()
+        if state.get("status") == "blocked":
+            saved_blocked_until = parse_timestamp(state.get("blockedUntil"))
+            if saved_blocked_until is not None and saved_blocked_until <= current_time:
+                return 0
+
+        block_until = block_until_from_state(state, now=current_time, max_state_age_seconds=max_state_age_seconds)
         if block_until is None:
             decision = poller()
             if decision.status != "blocked" or decision.blocked_until is None:
@@ -293,7 +301,9 @@ def wait_if_blocked(
             return 0
 
         seconds = max(1, min(poll_interval_seconds, int((block_until - current_time).total_seconds())))
-        output(f"Quota Sentry: Codex quota guard active until {format_timestamp(block_until)}.")
+        if verbose and not emitted_wait_message:
+            output(f"Quota Sentry: Codex quota guard active until {format_timestamp(block_until)}.")
+            emitted_wait_message = True
         sleeper(seconds)
 
 

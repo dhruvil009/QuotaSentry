@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+ROOT = Path(__file__).resolve().parents[1]
+QUOTA_SENTRY = ROOT / "scripts" / "quota-sentry"
+DEFAULT_RUN_ROOT = ROOT / ".quota-sentry-runs"
+
+
+SCENARIOS = [
+    ("AT-001", "live codexbar smoke"),
+    ("AT-002", "synthetic open poll"),
+    ("AT-003", "synthetic blocked guard wait"),
+    ("AT-004", "daemon lifecycle"),
+    ("AT-005", "hook installer temp merge"),
+    ("AT-006", "global hook config"),
+    ("AT-007", "codexbar failure fails open"),
+]
+
+
+@dataclass
+class CommandRecord:
+    args: List[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    duration_seconds: float
+
+
+@dataclass
+class ScenarioResult:
+    scenario_id: str
+    title: str
+    status: str = "PASS"
+    notes: List[str] = field(default_factory=list)
+    commands: List[CommandRecord] = field(default_factory=list)
+
+
+class AutonomousTestError(Exception):
+    pass
+
+
+class Harness:
+    def __init__(self, run_dir: Path, skip_live: bool):
+        self.run_dir = run_dir
+        self.skip_live = skip_live
+        self.results: List[ScenarioResult] = []
+        self.fake_bin = run_dir / "fake-bin"
+        self.fake_bin.mkdir(parents=True, exist_ok=True)
+        self._write_fake_codexbar()
+
+    def _write_fake_codexbar(self) -> None:
+        script = self.fake_bin / "codexbar"
+        script.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+mode = os.environ.get("QUOTA_SENTRY_FAKE_MODE", "open")
+now = datetime.now(timezone.utc)
+
+def ts(delta_seconds):
+    return (now + timedelta(seconds=delta_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+if mode == "exit-failure":
+    print("simulated codexbar failure", file=sys.stderr)
+    sys.exit(2)
+
+if mode == "provider-error":
+    print(json.dumps([{"provider": "codex", "source": "codex-cli", "error": {"message": "simulated provider error"}}]))
+    sys.exit(0)
+
+used = 12
+reset_delta = 300
+if mode == "blocked-short":
+    used = 99
+    reset_delta = 2
+elif mode == "notify-open":
+    print("[codex notify] remoteControl/status/changed")
+
+payload = [
+    {
+        "provider": "codex",
+        "source": "codex-cli",
+        "usage": {
+            "primary": {
+                "usedPercent": used,
+                "windowMinutes": 300,
+                "resetsAt": ts(reset_delta),
+            },
+            "secondary": {
+                "usedPercent": 10,
+                "windowMinutes": 10080,
+                "resetsAt": ts(604800),
+            },
+            "updatedAt": ts(0),
+        },
+    }
+]
+print(json.dumps(payload))
+"""
+        )
+        script.chmod(0o755)
+
+    def env(self, fake_mode: Optional[str] = None) -> Dict[str, str]:
+        env = os.environ.copy()
+        env["PATH"] = f"{self.fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        if fake_mode:
+            env["QUOTA_SENTRY_FAKE_MODE"] = fake_mode
+        return env
+
+    def run(
+        self,
+        result: ScenarioResult,
+        args: List[str],
+        *,
+        env: Optional[Dict[str, str]] = None,
+        timeout: int = 20,
+        expected_returncode: int = 0,
+    ) -> subprocess.CompletedProcess:
+        started = time.monotonic()
+        completed = subprocess.run(
+            args,
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        duration = time.monotonic() - started
+        result.commands.append(
+            CommandRecord(
+                args=args,
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                duration_seconds=duration,
+            )
+        )
+        if completed.returncode != expected_returncode:
+            raise AutonomousTestError(
+                f"{' '.join(args)} exited {completed.returncode}, expected {expected_returncode}"
+            )
+        return completed
+
+    def state(self, state_dir: Path) -> Dict[str, object]:
+        state_path = state_dir / "state.json"
+        if not state_path.exists():
+            raise AutonomousTestError(f"state file was not created: {state_path}")
+        return json.loads(state_path.read_text())
+
+    def wait_for_state(self, state_dir: Path, timeout_seconds: int = 6) -> Dict[str, object]:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            state_path = state_dir / "state.json"
+            if state_path.exists():
+                return json.loads(state_path.read_text())
+            time.sleep(0.2)
+        raise AutonomousTestError(f"state file was not created within {timeout_seconds}s: {state_dir}")
+
+    def run_scenario(self, scenario_id: str, title: str, scenario) -> None:
+        result = ScenarioResult(scenario_id=scenario_id, title=title)
+        try:
+            scenario(result)
+        except Exception as exc:
+            result.status = "FAIL"
+            result.notes.append(str(exc))
+        self.results.append(result)
+
+    def scenario_live_codexbar_smoke(self, result: ScenarioResult) -> None:
+        if self.skip_live:
+            result.status = "SKIP"
+            result.notes.append("Skipped by --skip-live.")
+            return
+        state_dir = self.run_dir / "live-smoke"
+        self.run(result, [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)], timeout=60)
+        state = self.state(state_dir)
+        if state.get("status") not in {"open", "blocked"}:
+            raise AutonomousTestError(f"live codexbar smoke returned unexpected state: {state}")
+        result.notes.append(f"Live state: {state.get('status')} at {state.get('usedPercent')}% used.")
+
+    def scenario_synthetic_open_poll(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "synthetic-open"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("notify-open"),
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "open" or state.get("usedPercent") != 12:
+            raise AutonomousTestError(f"expected open 12% state, got: {state}")
+        result.notes.append("Open quota state was parsed through a codex notify prefix.")
+
+    def scenario_synthetic_blocked_guard_wait(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "blocked-guard"
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "poll",
+                "--state-dir",
+                str(state_dir),
+                "--reset-buffer-seconds",
+                "0",
+            ],
+            env=self.env("blocked-short"),
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "blocked":
+            raise AutonomousTestError(f"expected blocked state, got: {state}")
+        started = time.monotonic()
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "guard",
+                "--state-dir",
+                str(state_dir),
+                "--interval-seconds",
+                "1",
+                "--max-state-age-seconds",
+                "30",
+                "--verbose",
+            ],
+            env=self.env("open"),
+            timeout=8,
+        )
+        quiet_state_dir = self.run_dir / "blocked-guard-quiet"
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "poll",
+                "--state-dir",
+                str(quiet_state_dir),
+                "--reset-buffer-seconds",
+                "0",
+            ],
+            env=self.env("blocked-short"),
+        )
+        quiet_result = self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "guard",
+                "--state-dir",
+                str(quiet_state_dir),
+                "--interval-seconds",
+                "1",
+                "--max-state-age-seconds",
+                "30",
+            ],
+            env=self.env("open"),
+            timeout=8,
+        )
+        if quiet_result.stdout.strip() or quiet_result.stderr.strip():
+            raise AutonomousTestError(
+                f"quiet guard emitted hook output: stdout={quiet_result.stdout!r} stderr={quiet_result.stderr!r}"
+            )
+        elapsed = time.monotonic() - started
+        if elapsed < 1:
+            raise AutonomousTestError(f"guard returned too quickly for a blocked state: {elapsed:.2f}s")
+        if elapsed > 12:
+            raise AutonomousTestError(f"guard took too long for short blocked state: {elapsed:.2f}s")
+        result.notes.append(f"Guard waited {elapsed:.2f}s for synthetic resets and quiet mode emitted no output.")
+
+    def scenario_daemon_lifecycle(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "daemon"
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "start",
+                "--state-dir",
+                str(state_dir),
+                "--interval-seconds",
+                "1",
+            ],
+            env=self.env("open"),
+        )
+        try:
+            state = self.wait_for_state(state_dir)
+            if state.get("status") != "open":
+                raise AutonomousTestError(f"daemon wrote unexpected state: {state}")
+            status = self.run(
+                result,
+                [str(QUOTA_SENTRY), "status", "--state-dir", str(state_dir)],
+                env=self.env("open"),
+            )
+            if "daemon pid" not in status.stdout:
+                raise AutonomousTestError(f"status did not report daemon pid: {status.stdout}")
+        finally:
+            self.run(
+                result,
+                [str(QUOTA_SENTRY), "stop", "--state-dir", str(state_dir)],
+                env=self.env("open"),
+            )
+        result.notes.append("Daemon started, wrote state, reported pid, and stopped.")
+
+    def scenario_hook_installer_temp_merge(self, result: ScenarioResult) -> None:
+        hooks_path = self.run_dir / "hooks.json"
+        hooks_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [
+                            {
+                                "matcher": "startup",
+                                "hooks": [{"type": "command", "command": "echo existing"}],
+                            }
+                        ]
+                    }
+                }
+            )
+        )
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "install-hook",
+                "--hooks-path",
+                str(hooks_path),
+                "--script-path",
+                str(QUOTA_SENTRY),
+            ],
+        )
+        merged = json.loads(hooks_path.read_text())
+        serialized = json.dumps(merged)
+        if "echo existing" not in serialized:
+            raise AutonomousTestError("existing hook was not preserved")
+        for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
+            if event_name not in merged.get("hooks", {}):
+                raise AutonomousTestError(f"missing hook event after merge: {event_name}")
+        if not hooks_path.with_suffix(".json.bak").exists():
+            raise AutonomousTestError("expected hook backup was not written")
+        result.notes.append("Temp hook install preserved existing hooks and wrote a backup.")
+
+    def scenario_global_hook_config(self, result: ScenarioResult) -> None:
+        hooks_path = Path.home() / ".codex" / "hooks.json"
+        if not hooks_path.exists():
+            raise AutonomousTestError(f"global Codex hooks file does not exist: {hooks_path}")
+        payload = json.loads(hooks_path.read_text())
+        serialized = json.dumps(payload)
+        expected = str(QUOTA_SENTRY)
+        if expected not in serialized:
+            raise AutonomousTestError(f"global hooks do not reference {expected}")
+        for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
+            if event_name not in payload.get("hooks", {}):
+                raise AutonomousTestError(f"global hooks missing {event_name}")
+        result.notes.append("Installed global hooks reference this checkout.")
+
+    def scenario_codexbar_failure_fails_open(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "codexbar-failure"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("exit-failure"),
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "unknown" or state.get("failOpen") is not True:
+            raise AutonomousTestError(f"expected unknown fail-open state, got: {state}")
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "guard",
+                "--state-dir",
+                str(state_dir),
+                "--interval-seconds",
+                "1",
+                "--max-state-age-seconds",
+                "30",
+            ],
+            env=self.env("open"),
+            timeout=5,
+        )
+        result.notes.append("Failed codexbar poll wrote unknown state and guard returned open.")
+
+    def run_all(self) -> None:
+        self.run_scenario("AT-001", "live codexbar smoke", self.scenario_live_codexbar_smoke)
+        self.run_scenario("AT-002", "synthetic open poll", self.scenario_synthetic_open_poll)
+        self.run_scenario("AT-003", "synthetic blocked guard wait", self.scenario_synthetic_blocked_guard_wait)
+        self.run_scenario("AT-004", "daemon lifecycle", self.scenario_daemon_lifecycle)
+        self.run_scenario("AT-005", "hook installer temp merge", self.scenario_hook_installer_temp_merge)
+        self.run_scenario("AT-006", "global hook config", self.scenario_global_hook_config)
+        self.run_scenario("AT-007", "codexbar failure fails open", self.scenario_codexbar_failure_fails_open)
+
+    def write_report(self) -> Path:
+        report_path = self.run_dir / "report.md"
+        lines = [
+            "# Quota Sentry Autonomous Test Report",
+            "",
+            f"- Run directory: `{self.run_dir}`",
+            f"- Started: `{datetime.now(timezone.utc).replace(microsecond=0).isoformat()}`",
+            "",
+            "## Summary",
+            "",
+        ]
+        for result in self.results:
+            lines.append(f"- {result.status}: {result.scenario_id} {result.title}")
+        lines.append("")
+        for result in self.results:
+            lines.extend([f"## {result.scenario_id}: {result.title}", "", f"Status: **{result.status}**", ""])
+            if result.notes:
+                lines.append("Notes:")
+                for note in result.notes:
+                    lines.append(f"- {note}")
+                lines.append("")
+            if result.commands:
+                lines.append("Commands:")
+                for command in result.commands:
+                    lines.append("")
+                    lines.append(f"- `{' '.join(command.args)}`")
+                    lines.append(f"  - exit: `{command.returncode}`")
+                    lines.append(f"  - duration: `{command.duration_seconds:.2f}s`")
+                    if command.stdout.strip():
+                        lines.append("  - stdout:")
+                        lines.append("    ```text")
+                        lines.extend(f"    {line}" for line in command.stdout.strip().splitlines()[:40])
+                        lines.append("    ```")
+                    if command.stderr.strip():
+                        lines.append("  - stderr:")
+                        lines.append("    ```text")
+                        lines.extend(f"    {line}" for line in command.stderr.strip().splitlines()[:40])
+                        lines.append("    ```")
+                lines.append("")
+        report_path.write_text("\n".join(lines) + "\n")
+        return report_path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Quota Sentry autonomous E2E tests.")
+    parser.add_argument("--list", action="store_true", help="List scenarios without running them.")
+    parser.add_argument("--skip-live", action="store_true", help="Skip the real codexbar smoke scenario.")
+    parser.add_argument("--run-dir", default=None, help="Directory for test artifacts.")
+    parser.add_argument("--cleanup", action="store_true", help="Remove run artifacts after a successful run.")
+    return parser.parse_args()
+
+
+def list_scenarios() -> None:
+    for scenario_id, title in SCENARIOS:
+        print(f"{scenario_id} {title}")
+
+
+def main() -> int:
+    args = parse_args()
+    if args.list:
+        list_scenarios()
+        return 0
+
+    run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else (
+        DEFAULT_RUN_ROOT / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    )
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True)
+
+    harness = Harness(run_dir=run_dir, skip_live=args.skip_live)
+    harness.run_all()
+    report_path = harness.write_report()
+
+    failures = [result for result in harness.results if result.status == "FAIL"]
+    skipped = [result for result in harness.results if result.status == "SKIP"]
+    passed = [result for result in harness.results if result.status == "PASS"]
+
+    for result in harness.results:
+        print(f"{result.status}: {result.scenario_id} {result.title}")
+        for note in result.notes:
+            print(f"  {note}")
+    print(f"Report: {report_path}")
+
+    if failures:
+        return 1
+    if skipped:
+        print(f"Skipped: {len(skipped)}")
+    print(f"Passed: {len(passed)}")
+
+    if args.cleanup:
+        shutil.rmtree(run_dir)
+        print("Artifacts cleaned up.")
+    else:
+        print("Artifacts kept for inspection. Remove the run directory when done.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

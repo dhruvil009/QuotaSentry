@@ -30,9 +30,14 @@ Run from the plugin root:
 ./scripts/quota-sentry guard
 ./scripts/quota-sentry stop
 ./scripts/quota-sentry install-hook
+./scripts/autonomous-test
 ```
 
 Use `install-hook` to merge global hooks into `~/.codex/hooks.json`. Restart Codex if the current session does not pick them up.
+
+Use `./scripts/autonomous-test` for the E2E harness. It performs one live `codexbar` smoke poll and uses fake `codexbar` binaries for quota-edge scenarios so it does not burn quota through repeated real prompts.
+
+`guard` is quiet by default to avoid flooding Codex hook context after long waits. Use `guard --verbose` only for manual debugging.
 
 ## Bypass
 

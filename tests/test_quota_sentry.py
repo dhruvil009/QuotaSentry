@@ -1,7 +1,8 @@
 import json
+import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from quota_sentry import core
@@ -152,6 +153,66 @@ class StateTest(unittest.TestCase):
 
         self.assertIsNone(block_until)
 
+    def test_wait_if_blocked_is_quiet_by_default(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "2026-06-01T16:30:00Z",
+            "blockedUntil": "2026-06-01T16:31:01Z",
+        }
+        now_values = [
+            datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc),
+            datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc),
+            datetime(2026, 6, 1, 16, 31, 1, tzinfo=timezone.utc),
+        ]
+        messages = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps(state))
+
+            result = core.wait_if_blocked(
+                state_path,
+                poller=lambda: self.fail("poller should not be called for fresh blocked state"),
+                sleeper=lambda _seconds: None,
+                now_func=lambda: now_values.pop(0),
+                output=messages.append,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(messages, [])
+
+    def test_wait_if_blocked_can_emit_single_verbose_message(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "2026-06-01T16:30:00Z",
+            "blockedUntil": "2026-06-01T16:31:01Z",
+        }
+        current = {"value": datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc)}
+        messages = []
+
+        def sleeper(seconds):
+            current["value"] = current["value"] + timedelta(seconds=seconds)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps(state))
+
+            result = core.wait_if_blocked(
+                state_path,
+                poller=lambda: self.fail("poller should not be called for fresh blocked state"),
+                sleeper=sleeper,
+                now_func=lambda: current["value"],
+                poll_interval_seconds=30,
+                output=messages.append,
+                verbose=True,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            messages,
+            ["Quota Sentry: Codex quota guard active until 2026-06-01T16:31:01Z."],
+        )
+
 
 class HookInstallTest(unittest.TestCase):
     def test_empty_hooks_file_loads_as_empty_config(self):
@@ -206,6 +267,21 @@ class CliStatusTest(unittest.TestCase):
         self.assertIn("blocked", text)
         self.assertIn("97%", text)
         self.assertIn("2026-06-01T21:24:05Z", text)
+
+
+class AutonomousHarnessTest(unittest.TestCase):
+    def test_autonomous_harness_lists_scenarios(self):
+        result = subprocess.run(
+            ["./scripts/autonomous-test", "--list"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("AT-001 live codexbar smoke", result.stdout)
+        self.assertIn("AT-006 global hook config", result.stdout)
 
 
 if __name__ == "__main__":

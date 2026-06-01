@@ -24,6 +24,8 @@ Run from this plugin root:
 ./scripts/quota-sentry stop
 ```
 
+`guard` is quiet by default because Codex surfaces hook output back into the TUI after long waits. Use `./scripts/quota-sentry guard --verbose` only when running it manually and you want a single wait message.
+
 Install global Codex hooks:
 
 ```bash
@@ -71,3 +73,11 @@ Run tests:
 ```bash
 PYTHONPATH=src python3 -m unittest tests/test_quota_sentry.py -v
 ```
+
+Run autonomous E2E tests:
+
+```bash
+./scripts/autonomous-test
+```
+
+The autonomous harness runs one live `codexbar` smoke poll, then uses synthetic `codexbar` binaries for quota-edge scenarios. It writes a report under `.quota-sentry-runs/`.

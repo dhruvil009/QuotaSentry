@@ -1,0 +1,212 @@
+import json
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+
+from quota_sentry import core
+from quota_sentry import cli
+
+
+NOW = datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc)
+
+
+def codexbar_payload(used_percent=94, resets_at="2026-06-01T21:23:05Z"):
+    return [
+        {
+            "provider": "codex",
+            "source": "codex-cli",
+            "usage": {
+                "primary": {
+                    "usedPercent": used_percent,
+                    "windowMinutes": 300,
+                    "resetsAt": resets_at,
+                },
+                "secondary": {
+                    "usedPercent": 39,
+                    "windowMinutes": 10080,
+                    "resetsAt": "2026-06-07T21:45:36Z",
+                },
+                "updatedAt": "2026-06-01T16:29:59Z",
+            },
+        }
+    ]
+
+
+class ParseCodexbarUsageTest(unittest.TestCase):
+    def test_extract_json_skips_codex_notify_prefix(self):
+        payload = core.extract_json(
+            "[codex notify] remoteControl/status/changed\n"
+            '[{"provider":"codex","usage":{"primary":{"usedPercent":1}}}]'
+        )
+
+        self.assertEqual(payload[0]["provider"], "codex")
+
+    def test_allows_when_five_hour_window_is_below_threshold(self):
+        decision = core.parse_codexbar_usage(
+            codexbar_payload(used_percent=94),
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.status, "open")
+        self.assertEqual(decision.used_percent, 94)
+        self.assertEqual(decision.window_minutes, 300)
+        self.assertIsNone(decision.blocked_until)
+
+    def test_blocks_until_reset_plus_buffer_at_threshold(self):
+        decision = core.parse_codexbar_usage(
+            codexbar_payload(used_percent=95),
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.status, "blocked")
+        self.assertEqual(decision.used_percent, 95)
+        self.assertEqual(
+            decision.blocked_until,
+            datetime(2026, 6, 1, 21, 24, 5, tzinfo=timezone.utc),
+        )
+
+    def test_opens_after_reset_time_has_passed(self):
+        decision = core.parse_codexbar_usage(
+            codexbar_payload(used_percent=99, resets_at="2026-06-01T16:00:00Z"),
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.status, "open")
+        self.assertIn("reset time has passed", decision.reason)
+
+    def test_fails_open_on_provider_error(self):
+        decision = core.parse_codexbar_usage(
+            [{"provider": "codex", "error": {"message": "cookie access denied"}}],
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.status, "unknown")
+        self.assertTrue(decision.fail_open)
+        self.assertIn("cookie access denied", decision.reason)
+
+    def test_prefers_the_five_hour_window_even_if_it_is_not_primary(self):
+        payload = codexbar_payload(used_percent=12)
+        payload[0]["usage"]["primary"]["windowMinutes"] = 10080
+        payload[0]["usage"]["primary"]["usedPercent"] = 15
+        payload[0]["usage"]["secondary"]["windowMinutes"] = 300
+        payload[0]["usage"]["secondary"]["usedPercent"] = 97
+
+        decision = core.parse_codexbar_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.status, "blocked")
+        self.assertEqual(decision.used_percent, 97)
+        self.assertEqual(decision.window_minutes, 300)
+
+
+class StateTest(unittest.TestCase):
+    def test_state_round_trips_decision_as_json(self):
+        decision = core.parse_codexbar_usage(
+            codexbar_payload(used_percent=95),
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            core.write_state(state_path, decision, now=NOW)
+            loaded = core.read_state(state_path)
+
+        self.assertEqual(loaded["status"], "blocked")
+        self.assertEqual(loaded["usedPercent"], 95)
+        self.assertEqual(loaded["blockedUntil"], "2026-06-01T21:24:05Z")
+
+    def test_should_block_from_state_requires_fresh_blocked_state(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "2026-06-01T16:29:30Z",
+            "blockedUntil": "2026-06-01T21:24:05Z",
+        }
+
+        block_until = core.block_until_from_state(state, now=NOW, max_state_age_seconds=120)
+
+        self.assertEqual(block_until, datetime(2026, 6, 1, 21, 24, 5, tzinfo=timezone.utc))
+
+    def test_should_not_block_from_stale_state(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "2026-06-01T16:00:00Z",
+            "blockedUntil": "2026-06-01T21:24:05Z",
+        }
+
+        block_until = core.block_until_from_state(state, now=NOW, max_state_age_seconds=120)
+
+        self.assertIsNone(block_until)
+
+
+class HookInstallTest(unittest.TestCase):
+    def test_empty_hooks_file_loads_as_empty_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hooks_path = Path(temp_dir) / "hooks.json"
+            hooks_path.write_text("")
+
+            self.assertEqual(cli.read_hooks_config(hooks_path), {})
+
+    def test_merge_hook_config_preserves_existing_hooks(self):
+        existing = {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [{"type": "command", "command": "echo existing"}],
+                    }
+                ]
+            }
+        }
+
+        merged = core.merge_codex_hooks(existing, script_path=Path("/opt/quota-sentry"))
+
+        self.assertEqual(len(merged["hooks"]["SessionStart"]), 2)
+        self.assertIn("UserPromptSubmit", merged["hooks"])
+        self.assertIn("PreToolUse", merged["hooks"])
+        serialized = json.dumps(merged)
+        self.assertIn("/opt/quota-sentry start", serialized)
+        self.assertIn("/opt/quota-sentry guard", serialized)
+
+
+class CliStatusTest(unittest.TestCase):
+    def test_common_options_are_accepted_after_subcommand(self):
+        args = cli.build_parser().parse_args(["poll", "--state-dir", ".quota-sentry-test"])
+
+        self.assertEqual(args.command, "poll")
+        self.assertEqual(args.state_dir, ".quota-sentry-test")
+
+    def test_status_text_for_missing_state(self):
+        self.assertEqual(cli.status_text({}), "Quota Sentry: no state found")
+
+    def test_status_text_for_blocked_state(self):
+        text = cli.status_text(
+            {
+                "status": "blocked",
+                "usedPercent": 97,
+                "blockedUntil": "2026-06-01T21:24:05Z",
+                "updatedAt": "2026-06-01T16:29:30Z",
+            }
+        )
+
+        self.assertIn("blocked", text)
+        self.assertIn("97%", text)
+        self.assertIn("2026-06-01T21:24:05Z", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

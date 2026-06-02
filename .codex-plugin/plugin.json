@@ -1,6 +1,6 @@
 {
   "name": "quota-sentry",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codex quota guard that monitors the 5-hour usage window and waits near reset.",
   "author": {
     "name": "Quota Sentry contributors"

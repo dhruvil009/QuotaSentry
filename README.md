@@ -1,10 +1,10 @@
 # Quota Sentry
 
-Quota Sentry is a local quota guard for agent harnesses. Version `v0.1.0` supports Codex by watching the Codex 5-hour usage window via `codexbar` and blocking future Codex lifecycle activity once the configured threshold is reached.
+Quota Sentry is a local quota guard for agent harnesses. The `v0.1.x` line supports Codex by watching the Codex 5-hour usage window via `codexbar` and blocking future Codex lifecycle activity once the configured threshold is reached.
 
 ## Current Scope
 
-- Codex only in `v0.1.0`; additional harness adapters are welcome.
+- Codex only in `v0.1.x`; additional harness adapters are welcome.
 - Uses `codexbar usage --provider codex --source cli --format json`.
 - Monitors the 5-hour window (`windowMinutes: 300`) by default.
 - Blocks at `usedPercent >= 95` until `resetsAt` plus a 60-second buffer.

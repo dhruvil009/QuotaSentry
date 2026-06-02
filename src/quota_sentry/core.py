@@ -84,12 +84,18 @@ def emit_terminal_notice(message: str) -> None:
             return
         return
 
+    flags = os.O_WRONLY | getattr(os, "O_NOCTTY", 0)
+    fd: Optional[int] = None
     try:
-        with open("/dev/tty", "w") as tty:
-            tty.write("\n" + message + "\n")
-            tty.flush()
+        fd = os.open("/dev/tty", flags)
+        if os.tcgetpgrp(fd) != os.getpgrp():
+            return
+        os.write(fd, ("\n" + message + "\n").encode())
     except OSError:
         return
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _codex_entry(payload: Any) -> Optional[Dict[str, Any]]:
@@ -261,7 +267,14 @@ def fetch_codexbar_usage(timeout_seconds: int = DEFAULT_CODEXBAR_TIMEOUT_SECONDS
         "--format",
         "json",
     ]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds, check=False)
+    completed = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
     output = completed.stdout or completed.stderr
     if completed.returncode != 0 and not output.strip():
         raise RuntimeError(f"codexbar exited with {completed.returncode}")
@@ -364,7 +377,7 @@ def merge_codex_hooks(existing: Dict[str, Any], script_path: Path) -> Dict[str, 
     merged = json.loads(json.dumps(existing or {}))
     hooks = merged.setdefault("hooks", {})
     script = shlex.quote(str(script_path))
-    start_command = f"{script} start"
+    start_command = f"{script} start --quiet"
     guard_command = f"{script} guard"
 
     additions = {

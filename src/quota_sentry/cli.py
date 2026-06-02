@@ -128,7 +128,6 @@ def start_command(args: argparse.Namespace) -> int:
 
     state_dir.mkdir(parents=True, exist_ok=True)
     log_path = core.default_log_path(state_dir)
-    log_file = log_path.open("ab")
     command = [
         str(script_path()),
         "daemon",
@@ -141,10 +140,19 @@ def start_command(args: argparse.Namespace) -> int:
         "--interval-seconds",
         str(args.interval_seconds),
     ]
-    process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
     write_pid(pid_path, process.pid)
-    print(f"Quota Sentry: daemon started with pid {process.pid}")
-    print(f"Quota Sentry: log {log_path}")
+    if not args.quiet:
+        print(f"Quota Sentry: daemon started with pid {process.pid}")
+        print(f"Quota Sentry: log {log_path}")
     return 0
 
 
@@ -229,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_parser = subparsers.add_parser("start", parents=[common])
     start_parser.add_argument("--interval-seconds", type=int, default=core.DEFAULT_POLL_INTERVAL_SECONDS)
+    start_parser.add_argument("--quiet", action="store_true")
     start_parser.set_defaults(func=start_command)
 
     stop_parser = subparsers.add_parser("stop", parents=[common])

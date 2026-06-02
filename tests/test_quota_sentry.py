@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from quota_sentry import core
 from quota_sentry import cli
@@ -190,6 +191,31 @@ class StateTest(unittest.TestCase):
                 else:
                     os.environ["QUOTA_SENTRY_NOTICE_FILE"] = old_value
 
+    def test_terminal_notice_skips_background_process_group(self):
+        writes = []
+
+        with mock.patch.object(core.os, "open", return_value=7), \
+            mock.patch.object(core.os, "tcgetpgrp", return_value=100), \
+            mock.patch.object(core.os, "getpgrp", return_value=200), \
+            mock.patch.object(core.os, "write", side_effect=lambda _fd, data: writes.append(data)), \
+            mock.patch.object(core.os, "close") as close:
+            core.emit_terminal_notice("test")
+
+        self.assertEqual(writes, [])
+        close.assert_called_once_with(7)
+
+    def test_terminal_notice_writes_foreground_process_group(self):
+        writes = []
+
+        with mock.patch.object(core.os, "open", return_value=7), \
+            mock.patch.object(core.os, "tcgetpgrp", return_value=100), \
+            mock.patch.object(core.os, "getpgrp", return_value=100), \
+            mock.patch.object(core.os, "write", side_effect=lambda _fd, data: writes.append(data)), \
+            mock.patch.object(core.os, "close"):
+            core.emit_terminal_notice("Quota Sentry: test")
+
+        self.assertEqual(writes, [b"\nQuota Sentry: test\n"])
+
     def test_wait_if_blocked_is_quiet_by_default(self):
         state = {
             "status": "blocked",
@@ -311,8 +337,48 @@ class HookInstallTest(unittest.TestCase):
         self.assertIn("UserPromptSubmit", merged["hooks"])
         self.assertIn("PreToolUse", merged["hooks"])
         serialized = json.dumps(merged)
-        self.assertIn("/opt/quota-sentry start", serialized)
+        self.assertIn("/opt/quota-sentry start --quiet", serialized)
         self.assertIn("/opt/quota-sentry guard", serialized)
+
+
+class CodexbarFetchTest(unittest.TestCase):
+    def test_fetch_codexbar_usage_detaches_stdin(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(codexbar_payload()),
+                stderr="",
+            )
+
+        with mock.patch.object(core.subprocess, "run", side_effect=fake_run):
+            payload = core.fetch_codexbar_usage()
+
+        self.assertEqual(payload[0]["provider"], "codex")
+        self.assertIs(calls[0][1]["stdin"], subprocess.DEVNULL)
+
+
+class DaemonStartTest(unittest.TestCase):
+    def test_start_daemon_detaches_stdin(self):
+        popen_kwargs = {}
+
+        class FakeProcess:
+            pid = 12345
+
+        def fake_popen(_command, **kwargs):
+            popen_kwargs.update(kwargs)
+            return FakeProcess()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = cli.build_parser().parse_args(["start", "--quiet", "--state-dir", temp_dir])
+            with mock.patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
+                result = cli.start_command(args)
+
+        self.assertEqual(result, 0)
+        self.assertIs(popen_kwargs["stdin"], subprocess.DEVNULL)
 
 
 class CliStatusTest(unittest.TestCase):

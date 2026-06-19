@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -31,6 +32,22 @@ def status_text(state: Dict[str, Any]) -> str:
     if reason:
         pieces.append(str(reason))
     return " | ".join(pieces)
+
+
+def status_health_warnings(
+    state: Dict[str, Any],
+    daemon_running: bool,
+    now: Optional[datetime] = None,
+    max_state_age_seconds: int = core.DEFAULT_MAX_STATE_AGE_SECONDS,
+) -> list[str]:
+    if not state or daemon_running:
+        return []
+
+    current_time = now or core.utc_now()
+    updated_at = core.parse_timestamp(state.get("updatedAt"))
+    if updated_at is None or current_time - updated_at > timedelta(seconds=max_state_age_seconds):
+        return ["Quota Sentry: warning: state is stale and daemon is not running"]
+    return []
 
 
 def resolve_state_dir(value: Optional[str]) -> Path:
@@ -177,8 +194,11 @@ def status_command(args: argparse.Namespace) -> int:
     state = core.read_state(core.default_state_path(state_dir))
     print(status_text(state))
     pid = read_pid(core.default_pid_path(state_dir))
-    if pid and is_pid_alive(pid):
+    daemon_running = bool(pid and is_pid_alive(pid))
+    if daemon_running:
         print(f"Quota Sentry: daemon pid {pid}")
+    for warning in status_health_warnings(state, daemon_running=daemon_running):
+        print(warning)
     return 0
 
 

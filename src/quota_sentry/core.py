@@ -320,10 +320,11 @@ def wait_if_blocked(
 
     emitted_wait_message = False
     emitted_notice = False
+    waited_once = False
     while True:
         state = read_state(state_path)
         current_time = now_func()
-        if state.get("status") == "blocked":
+        if waited_once and state.get("status") == "blocked":
             saved_blocked_until = parse_timestamp(state.get("blockedUntil"))
             if saved_blocked_until is not None and saved_blocked_until <= current_time:
                 return 0
@@ -347,6 +348,7 @@ def wait_if_blocked(
             output(f"Quota Sentry: Codex quota guard active until {format_timestamp(block_until)}.")
             emitted_wait_message = True
         sleeper(seconds)
+        waited_once = True
 
 
 def hook_entry(matcher: str, command: str, async_value: bool, timeout_seconds: int) -> Dict[str, Any]:

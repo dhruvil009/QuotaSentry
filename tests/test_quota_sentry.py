@@ -244,6 +244,33 @@ class StateTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(messages, [])
 
+    def test_wait_if_blocked_polls_after_expired_blocked_state(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "2026-06-01T16:30:00Z",
+            "blockedUntil": "2026-06-01T16:31:01Z",
+        }
+        poll_count = {"value": 0}
+
+        def poller():
+            poll_count["value"] += 1
+            return core.QuotaDecision(status="open", reason="fresh quota poll", fail_open=False)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps(state))
+
+            result = core.wait_if_blocked(
+                state_path,
+                poller=poller,
+                sleeper=lambda _seconds: self.fail("expired state should not sleep"),
+                now_func=lambda: datetime(2026, 6, 1, 16, 32, 0, tzinfo=timezone.utc),
+                output=lambda _message: self.fail("quiet guard should not write stdout"),
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(poll_count["value"], 1)
+
     def test_wait_if_blocked_emits_single_wait_notice_without_stdout(self):
         state = {
             "status": "blocked",
@@ -404,6 +431,22 @@ class CliStatusTest(unittest.TestCase):
         self.assertIn("blocked", text)
         self.assertIn("97%", text)
         self.assertIn("2026-06-01T21:24:05Z", text)
+
+    def test_status_warns_when_state_is_stale_and_daemon_missing(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "2026-06-01T16:00:00Z",
+            "blockedUntil": "2026-06-01T21:24:05Z",
+        }
+
+        warnings = cli.status_health_warnings(
+            state,
+            daemon_running=False,
+            now=datetime(2026, 6, 1, 16, 10, 0, tzinfo=timezone.utc),
+            max_state_age_seconds=120,
+        )
+
+        self.assertIn("Quota Sentry: warning: state is stale and daemon is not running", warnings)
 
 
 class AutonomousHarnessTest(unittest.TestCase):

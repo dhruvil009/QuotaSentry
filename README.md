@@ -26,6 +26,8 @@ Run from this plugin root:
 ./scripts/quota-sentry stop
 ```
 
+`status` warns when the saved quota state is stale and the background daemon is not running. The synchronous `guard` command still self-heals by polling before deciding whether to block.
+
 `guard` keeps stdout/stderr quiet by default because Codex surfaces hook output back into the TUI after long waits. When it starts waiting, it writes one notice directly to the controlling terminal instead:
 
 ```text

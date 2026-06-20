@@ -13,8 +13,12 @@ DEFAULT_PROVIDER = "codex"
 DEFAULT_SOURCE = "cli"
 DEFAULT_THRESHOLD_PERCENT = 95
 DEFAULT_WINDOW_MINUTES = 300
-DEFAULT_POLL_INTERVAL_SECONDS = 60
-DEFAULT_MAX_STATE_AGE_SECONDS = 180
+DEFAULT_POLL_INTERVAL_SECONDS = 300
+DEFAULT_NEAR_POLL_INTERVAL_SECONDS = 60
+DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS = 30
+DEFAULT_NEAR_THRESHOLD_PERCENT = 85
+DEFAULT_CRITICAL_THRESHOLD_PERCENT = 93
+DEFAULT_MAX_STATE_AGE_SECONDS = 420
 DEFAULT_RESET_BUFFER_SECONDS = 60
 DEFAULT_CODEXBAR_TIMEOUT_SECONDS = 30
 
@@ -303,6 +307,28 @@ def poll_once(
     return decision
 
 
+def next_poll_interval_seconds(
+    decision: QuotaDecision,
+    base_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
+    near_threshold_percent: int = DEFAULT_NEAR_THRESHOLD_PERCENT,
+    near_interval_seconds: int = DEFAULT_NEAR_POLL_INTERVAL_SECONDS,
+    critical_threshold_percent: int = DEFAULT_CRITICAL_THRESHOLD_PERCENT,
+    critical_interval_seconds: int = DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS,
+) -> int:
+    base_interval = max(1, int(base_interval_seconds))
+    near_interval = max(1, int(near_interval_seconds))
+    critical_interval = max(1, int(critical_interval_seconds))
+
+    used = decision.used_percent
+    if used is None:
+        return base_interval
+    if used >= critical_threshold_percent:
+        return min(base_interval, critical_interval)
+    if used >= near_threshold_percent:
+        return min(base_interval, near_interval)
+    return base_interval
+
+
 def wait_if_blocked(
     state_path: Path,
     poller: Callable[[], QuotaDecision],
@@ -314,6 +340,7 @@ def wait_if_blocked(
     verbose: bool = False,
     notice: Callable[[str], None] = emit_terminal_notice,
     notify: bool = True,
+    state_only: bool = False,
 ) -> int:
     if os.environ.get("QUOTA_SENTRY_DISABLE") == "1":
         return 0
@@ -331,6 +358,8 @@ def wait_if_blocked(
 
         block_until = block_until_from_state(state, now=current_time, max_state_age_seconds=max_state_age_seconds)
         if block_until is None:
+            if state_only:
+                return 0
             decision = poller()
             if decision.status != "blocked" or decision.blocked_until is None:
                 return 0
@@ -380,12 +409,13 @@ def merge_codex_hooks(existing: Dict[str, Any], script_path: Path) -> Dict[str, 
     hooks = merged.setdefault("hooks", {})
     script = shlex.quote(str(script_path))
     start_command = f"{script} start --quiet"
-    guard_command = f"{script} guard"
+    user_prompt_command = f"{script} start --quiet; {script} guard"
+    pre_tool_command = f"{script} guard --state-only --no-notify"
 
     additions = {
         "SessionStart": hook_entry("startup|clear|compact", start_command, True, 30),
-        "UserPromptSubmit": hook_entry("", guard_command, False, 21600),
-        "PreToolUse": hook_entry(".*", guard_command, False, 21600),
+        "UserPromptSubmit": hook_entry("", user_prompt_command, False, 21600),
+        "PreToolUse": hook_entry(".*", pre_tool_command, False, 21600),
     }
 
     for event_name, entry in additions.items():

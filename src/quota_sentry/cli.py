@@ -22,6 +22,9 @@ def status_text(state: Dict[str, Any]) -> str:
     updated_at = state.get("updatedAt")
     reason = state.get("reason")
 
+    if status == "open" and used is not None:
+        return f"Quota Sentry: {used}% used"
+
     pieces = [f"Quota Sentry: {status}"]
     if used is not None:
         pieces.append(f"{used}% used")
@@ -123,7 +126,15 @@ def daemon_command(args: argparse.Namespace) -> int:
             reset_buffer_seconds=args.reset_buffer_seconds,
         )
         print(status_text(core.state_from_decision(decision)), flush=True)
-        for _ in range(args.interval_seconds):
+        sleep_seconds = core.next_poll_interval_seconds(
+            decision,
+            base_interval_seconds=args.interval_seconds,
+            near_threshold_percent=args.near_threshold_percent,
+            near_interval_seconds=args.near_interval_seconds,
+            critical_threshold_percent=args.critical_threshold_percent,
+            critical_interval_seconds=args.critical_interval_seconds,
+        )
+        for _ in range(sleep_seconds):
             if not keep_running:
                 break
             time.sleep(1)
@@ -140,7 +151,8 @@ def start_command(args: argparse.Namespace) -> int:
     pid_path = core.default_pid_path(state_dir)
     existing_pid = read_pid(pid_path)
     if existing_pid and is_pid_alive(existing_pid):
-        print(f"Quota Sentry: daemon already running with pid {existing_pid}")
+        if not args.quiet:
+            print(f"Quota Sentry: daemon already running with pid {existing_pid}")
         return 0
 
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -156,6 +168,14 @@ def start_command(args: argparse.Namespace) -> int:
         str(args.reset_buffer_seconds),
         "--interval-seconds",
         str(args.interval_seconds),
+        "--near-threshold-percent",
+        str(args.near_threshold_percent),
+        "--near-interval-seconds",
+        str(args.near_interval_seconds),
+        "--critical-threshold-percent",
+        str(args.critical_threshold_percent),
+        "--critical-interval-seconds",
+        str(args.critical_interval_seconds),
     ]
     with log_path.open("ab") as log_file:
         process = subprocess.Popen(
@@ -195,7 +215,7 @@ def status_command(args: argparse.Namespace) -> int:
     print(status_text(state))
     pid = read_pid(core.default_pid_path(state_dir))
     daemon_running = bool(pid and is_pid_alive(pid))
-    if daemon_running:
+    if daemon_running and args.verbose:
         print(f"Quota Sentry: daemon pid {pid}")
     for warning in status_health_warnings(state, daemon_running=daemon_running):
         print(warning)
@@ -220,6 +240,7 @@ def guard_command(args: argparse.Namespace) -> int:
         poll_interval_seconds=args.interval_seconds,
         verbose=args.verbose,
         notify=not args.no_notify,
+        state_only=args.state_only,
     )
 
 
@@ -253,10 +274,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     daemon_parser = subparsers.add_parser("daemon", parents=[common])
     daemon_parser.add_argument("--interval-seconds", type=int, default=core.DEFAULT_POLL_INTERVAL_SECONDS)
+    daemon_parser.add_argument("--near-threshold-percent", type=int, default=core.DEFAULT_NEAR_THRESHOLD_PERCENT)
+    daemon_parser.add_argument("--near-interval-seconds", type=int, default=core.DEFAULT_NEAR_POLL_INTERVAL_SECONDS)
+    daemon_parser.add_argument("--critical-threshold-percent", type=int, default=core.DEFAULT_CRITICAL_THRESHOLD_PERCENT)
+    daemon_parser.add_argument("--critical-interval-seconds", type=int, default=core.DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS)
     daemon_parser.set_defaults(func=daemon_command)
 
     start_parser = subparsers.add_parser("start", parents=[common])
     start_parser.add_argument("--interval-seconds", type=int, default=core.DEFAULT_POLL_INTERVAL_SECONDS)
+    start_parser.add_argument("--near-threshold-percent", type=int, default=core.DEFAULT_NEAR_THRESHOLD_PERCENT)
+    start_parser.add_argument("--near-interval-seconds", type=int, default=core.DEFAULT_NEAR_POLL_INTERVAL_SECONDS)
+    start_parser.add_argument("--critical-threshold-percent", type=int, default=core.DEFAULT_CRITICAL_THRESHOLD_PERCENT)
+    start_parser.add_argument("--critical-interval-seconds", type=int, default=core.DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS)
     start_parser.add_argument("--quiet", action="store_true")
     start_parser.set_defaults(func=start_command)
 
@@ -264,6 +293,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop_parser.set_defaults(func=stop_command)
 
     status_parser = subparsers.add_parser("status", parents=[common])
+    status_parser.add_argument("--verbose", action="store_true")
     status_parser.set_defaults(func=status_command)
 
     guard_parser = subparsers.add_parser("guard", parents=[common])
@@ -271,6 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     guard_parser.add_argument("--max-state-age-seconds", type=int, default=core.DEFAULT_MAX_STATE_AGE_SECONDS)
     guard_parser.add_argument("--verbose", action="store_true")
     guard_parser.add_argument("--no-notify", action="store_true")
+    guard_parser.add_argument("--state-only", action="store_true")
     guard_parser.set_defaults(func=guard_command)
 
     install_parser = subparsers.add_parser("install-hook", parents=[common])

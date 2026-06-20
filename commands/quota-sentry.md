@@ -57,3 +57,8 @@ After hook installation, tell the user to restart Codex if the current session d
 ```
 
 `guard` should keep stdout/stderr quiet in hooks. It writes one wait notice directly to the controlling terminal when waiting starts. Use `./scripts/quota-sentry guard --verbose` only for manual debugging.
+
+Current hook model:
+
+- `UserPromptSubmit` starts the daemon quietly, then runs live `guard`.
+- `PreToolUse` runs `guard --state-only --no-notify` so tool hooks only read cached state and never invoke `codexbar`.

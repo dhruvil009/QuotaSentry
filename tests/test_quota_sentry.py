@@ -3,7 +3,9 @@ import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -271,6 +273,51 @@ class StateTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(poll_count["value"], 1)
 
+    def test_state_only_guard_does_not_poll_when_cache_is_stale(self):
+        state = {
+            "status": "open",
+            "updatedAt": "2026-06-01T16:00:00Z",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps(state))
+
+            result = core.wait_if_blocked(
+                state_path,
+                poller=lambda: self.fail("state-only guard must not call live poller"),
+                state_only=True,
+                now_func=lambda: NOW,
+            )
+
+        self.assertEqual(result, 0)
+
+    def test_state_only_guard_waits_on_fresh_blocked_state(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "2026-06-01T16:30:00Z",
+            "blockedUntil": "2026-06-01T16:31:01Z",
+        }
+        current = {"value": datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc)}
+
+        def sleeper(seconds):
+            current["value"] = current["value"] + timedelta(seconds=seconds)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps(state))
+
+            result = core.wait_if_blocked(
+                state_path,
+                poller=lambda: self.fail("state-only guard must not call live poller"),
+                sleeper=sleeper,
+                state_only=True,
+                now_func=lambda: current["value"],
+                notify=False,
+            )
+
+        self.assertEqual(result, 0)
+
     def test_wait_if_blocked_emits_single_wait_notice_without_stdout(self):
         state = {
             "status": "blocked",
@@ -363,9 +410,42 @@ class HookInstallTest(unittest.TestCase):
         self.assertEqual(len(merged["hooks"]["SessionStart"]), 2)
         self.assertIn("UserPromptSubmit", merged["hooks"])
         self.assertIn("PreToolUse", merged["hooks"])
-        serialized = json.dumps(merged)
-        self.assertIn("/opt/quota-sentry start --quiet", serialized)
-        self.assertIn("/opt/quota-sentry guard", serialized)
+        user_prompt_command = merged["hooks"]["UserPromptSubmit"][-1]["hooks"][0]["command"]
+        pre_tool_command = merged["hooks"]["PreToolUse"][-1]["hooks"][0]["command"]
+        self.assertEqual(user_prompt_command, "/opt/quota-sentry start --quiet; /opt/quota-sentry guard")
+        self.assertEqual(pre_tool_command, "/opt/quota-sentry guard --state-only --no-notify")
+
+
+class PollIntervalTest(unittest.TestCase):
+    def test_poll_interval_tightens_near_threshold(self):
+        base = core.next_poll_interval_seconds(
+            core.QuotaDecision(status="open", reason="open", used_percent=84),
+            base_interval_seconds=300,
+            near_threshold_percent=85,
+            near_interval_seconds=60,
+            critical_threshold_percent=93,
+            critical_interval_seconds=30,
+        )
+        near = core.next_poll_interval_seconds(
+            core.QuotaDecision(status="open", reason="open", used_percent=90),
+            base_interval_seconds=300,
+            near_threshold_percent=85,
+            near_interval_seconds=60,
+            critical_threshold_percent=93,
+            critical_interval_seconds=30,
+        )
+        critical = core.next_poll_interval_seconds(
+            core.QuotaDecision(status="open", reason="open", used_percent=94),
+            base_interval_seconds=300,
+            near_threshold_percent=85,
+            near_interval_seconds=60,
+            critical_threshold_percent=93,
+            critical_interval_seconds=30,
+        )
+
+        self.assertEqual(base, 300)
+        self.assertEqual(near, 60)
+        self.assertEqual(critical, 30)
 
 
 class CodexbarFetchTest(unittest.TestCase):
@@ -389,6 +469,11 @@ class CodexbarFetchTest(unittest.TestCase):
 
 
 class DaemonStartTest(unittest.TestCase):
+    def test_start_defaults_to_five_minute_daemon_interval(self):
+        args = cli.build_parser().parse_args(["start"])
+
+        self.assertEqual(args.interval_seconds, 300)
+
     def test_start_daemon_detaches_stdin(self):
         popen_kwargs = {}
 
@@ -406,6 +491,19 @@ class DaemonStartTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertIs(popen_kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_quiet_start_suppresses_existing_daemon_message(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pid_path = core.default_pid_path(Path(temp_dir))
+            cli.write_pid(pid_path, os.getpid())
+            args = cli.build_parser().parse_args(["start", "--quiet", "--state-dir", temp_dir])
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                result = cli.start_command(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout.getvalue(), "")
 
 
 class CliStatusTest(unittest.TestCase):
@@ -431,6 +529,39 @@ class CliStatusTest(unittest.TestCase):
         self.assertIn("blocked", text)
         self.assertIn("97%", text)
         self.assertIn("2026-06-01T21:24:05Z", text)
+
+    def test_status_text_for_open_state_is_lean(self):
+        text = cli.status_text(
+            {
+                "status": "open",
+                "usedPercent": 14,
+                "resetsAt": "2026-06-20T08:41:42Z",
+                "updatedAt": "2026-06-20T02:58:10Z",
+                "reason": "14% of the 300-minute Codex quota is used",
+            }
+        )
+
+        self.assertEqual(text, "Quota Sentry: 14% used")
+
+    def test_status_command_hides_daemon_pid_unless_verbose(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = core.default_state_path(Path(temp_dir))
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps({"status": "open", "usedPercent": 14}))
+            cli.write_pid(core.default_pid_path(Path(temp_dir)), os.getpid())
+
+            quiet_args = cli.build_parser().parse_args(["status", "--state-dir", temp_dir])
+            quiet_stdout = StringIO()
+            with redirect_stdout(quiet_stdout):
+                self.assertEqual(cli.status_command(quiet_args), 0)
+
+            verbose_args = cli.build_parser().parse_args(["status", "--verbose", "--state-dir", temp_dir])
+            verbose_stdout = StringIO()
+            with redirect_stdout(verbose_stdout):
+                self.assertEqual(cli.status_command(verbose_args), 0)
+
+        self.assertEqual(quiet_stdout.getvalue(), "Quota Sentry: 14% used\n")
+        self.assertIn("Quota Sentry: daemon pid", verbose_stdout.getvalue())
 
     def test_status_warns_when_state_is_stale_and_daemon_missing(self):
         state = {

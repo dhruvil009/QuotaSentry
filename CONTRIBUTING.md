@@ -73,8 +73,12 @@ Expected behavior:
 - `guard` may write one wait notice directly to the controlling terminal.
 - `guard --verbose` is for manual debugging only.
 - `QUOTA_SENTRY_DISABLE=1` bypasses blocking.
+- Installed Codex hook paths must not perform live `codexbar` polling.
+- Installed Codex hook paths must not open or write to `/dev/tty`; use `--no-notify` or `prompt-guard` for hook mode.
+- Installed hook commands must be single commands, not shell-composed chains with `;`, `&&`, or pipes.
+- Installed Codex hooks should be synchronous commands; Codex 0.140.0 skips async hooks.
 
-For other harnesses, preserve the same shape: quiet guard path, explicit debug mode, one terminal notice when blocking starts, and a documented bypass.
+For other harnesses, preserve the same shape: cache-only hook path, explicit debug mode, manual-only terminal notices, and a documented bypass.
 
 ## AI-Generated Code
 

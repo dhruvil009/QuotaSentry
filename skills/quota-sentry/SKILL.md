@@ -17,9 +17,9 @@ Quota Sentry is a local Codex quota guard.
 
 ## Important Constraint
 
-The background daemon observes quota and writes state every five minutes by default, tightening its cadence near the quota threshold. Actual blocking requires the synchronous `guard` command to run from a global Codex hook or wrapper. Do not claim that the daemon can interrupt an already-running model request.
+The background daemon observes quota and writes state every five minutes by default, tightening its cadence near the quota threshold. Actual blocking requires a synchronous guard path to run from a global Codex hook or wrapper. Do not claim that the daemon can interrupt an already-running model request.
 
-`PreToolUse` should use `guard --state-only --no-notify` so tool hooks only read cached daemon state and do not invoke `codexbar` during tool execution.
+Installed Codex hooks must only read cached daemon state and must not invoke `codexbar` from the hook process. `SessionStart` should run `start --quiet` synchronously because Codex 0.140.0 skips async hooks. `UserPromptSubmit` should use `prompt-guard`; `PreToolUse` should use `guard --state-only --no-notify`.
 
 ## Commands
 
@@ -39,7 +39,7 @@ Use `install-hook` to merge global hooks into `~/.codex/hooks.json`. Restart Cod
 
 Use `./scripts/autonomous-test` for the E2E harness. It performs one live `codexbar` smoke poll and uses fake `codexbar` binaries for quota-edge scenarios so it does not burn quota through repeated real prompts.
 
-`guard` keeps stdout/stderr quiet by default to avoid flooding Codex hook context after long waits. It still writes one wait notice directly to the controlling terminal when waiting starts. Use `guard --verbose` only for manual debugging, `guard --no-notify` to suppress the terminal notice, and `guard --state-only` when a hook must not perform a live `codexbar` poll.
+`guard` keeps stdout/stderr quiet by default to avoid flooding Codex hook context after long waits. It still writes one wait notice directly to the controlling terminal when waiting starts unless `--no-notify` is set. Use `guard --verbose` only for manual debugging, `guard --no-notify` to suppress the terminal notice, and `guard --state-only` when a hook must not perform a live `codexbar` poll.
 
 ## Bypass
 

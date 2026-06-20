@@ -60,5 +60,6 @@ After hook installation, tell the user to restart Codex if the current session d
 
 Current hook model:
 
-- `UserPromptSubmit` starts the daemon quietly, then runs live `guard`.
+- `SessionStart` runs `start --quiet` synchronously; the command returns after spawning the detached daemon.
+- `UserPromptSubmit` runs `prompt-guard`, which starts the daemon quietly and then checks cached state without terminal notices.
 - `PreToolUse` runs `guard --state-only --no-notify` so tool hooks only read cached state and never invoke `codexbar`.

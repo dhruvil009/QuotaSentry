@@ -26,6 +26,7 @@ SCENARIOS = [
     ("AT-006", "global hook config"),
     ("AT-007", "codexbar failure fails open"),
     ("AT-008", "state-only guard avoids live codexbar"),
+    ("AT-009", "prompt guard avoids live codexbar"),
 ]
 
 
@@ -318,6 +319,12 @@ print(json.dumps(payload))
                 [str(QUOTA_SENTRY), "stop", "--state-dir", str(state_dir)],
                 env=self.env("open"),
             )
+        pid_path = state_dir / "quota-sentry.pid"
+        deadline = time.monotonic() + 3
+        while pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if pid_path.exists():
+            raise AutonomousTestError(f"daemon pid file remained after stop: {pid_path}")
         result.notes.append("Daemon started, wrote state, reported pid, and stopped.")
 
     def scenario_hook_installer_temp_merge(self, result: ScenarioResult) -> None:
@@ -354,10 +361,20 @@ print(json.dumps(payload))
         for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
             if event_name not in merged.get("hooks", {}):
                 raise AutonomousTestError(f"missing hook event after merge: {event_name}")
+            event_hook = merged["hooks"][event_name][-1]["hooks"][0]
+            if event_hook.get("async") is not False:
+                raise AutonomousTestError(f"{event_name} hook must be synchronous for Codex 0.140 compatibility")
         user_prompt_command = merged["hooks"]["UserPromptSubmit"][-1]["hooks"][0]["command"]
         pre_tool_command = merged["hooks"]["PreToolUse"][-1]["hooks"][0]["command"]
-        if "start --quiet;" not in user_prompt_command or " guard" not in user_prompt_command:
-            raise AutonomousTestError(f"UserPromptSubmit hook does not start daemon then guard: {user_prompt_command}")
+        if "prompt-guard" not in user_prompt_command:
+            raise AutonomousTestError(f"UserPromptSubmit hook is not prompt-guard: {user_prompt_command}")
+        for metacharacter in (";", "&&", "|", "\n"):
+            if metacharacter in user_prompt_command:
+                raise AutonomousTestError(
+                    f"UserPromptSubmit hook uses shell composition {metacharacter!r}: {user_prompt_command}"
+                )
+        if user_prompt_command.count("quota-sentry") != 1:
+            raise AutonomousTestError(f"UserPromptSubmit hook invokes quota-sentry more than once: {user_prompt_command}")
         if "guard --state-only --no-notify" not in pre_tool_command:
             raise AutonomousTestError(f"PreToolUse hook is not cache-only: {pre_tool_command}")
         if not hooks_path.with_suffix(".json.bak").exists():
@@ -384,10 +401,20 @@ print(json.dumps(payload))
         for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
             if event_name not in payload.get("hooks", {}):
                 raise AutonomousTestError(f"global hooks missing {event_name}")
+            event_hook = payload["hooks"][event_name][-1]["hooks"][0]
+            if event_hook.get("async") is not False:
+                raise AutonomousTestError(f"global {event_name} hook must be synchronous for Codex 0.140 compatibility")
         user_prompt_serialized = json.dumps(payload["hooks"]["UserPromptSubmit"])
         pre_tool_serialized = json.dumps(payload["hooks"]["PreToolUse"])
-        if "start --quiet;" not in user_prompt_serialized:
-            raise AutonomousTestError("global UserPromptSubmit hook does not start daemon quietly")
+        if "prompt-guard" not in user_prompt_serialized:
+            raise AutonomousTestError("global UserPromptSubmit hook is not prompt-guard")
+        for metacharacter in (";", "&&", "|", "\n"):
+            if metacharacter in user_prompt_serialized:
+                raise AutonomousTestError(
+                    f"global UserPromptSubmit hook uses shell composition {metacharacter!r}"
+                )
+        if user_prompt_serialized.count("quota-sentry") != 1:
+            raise AutonomousTestError("global UserPromptSubmit hook invokes quota-sentry more than once")
         if "guard --state-only --no-notify" not in pre_tool_serialized:
             raise AutonomousTestError("global PreToolUse hook is not cache-only")
         result.notes.append("Installed global hooks reference this checkout.")
@@ -450,6 +477,36 @@ print(json.dumps(payload))
             raise AutonomousTestError(f"state-only guard should preserve cached open state, got: {state}")
         result.notes.append("State-only guard used cached state and did not call failing codexbar.")
 
+    def scenario_prompt_guard_avoids_live_codexbar(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "prompt-guard"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("open"),
+        )
+        (state_dir / "quota-sentry.pid").write_text(f"{os.getpid()}\n")
+        guard_result = self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "prompt-guard",
+                "--state-dir",
+                str(state_dir),
+                "--max-state-age-seconds",
+                "30",
+            ],
+            env=self.env("exit-failure"),
+            timeout=5,
+        )
+        if guard_result.stdout.strip() or guard_result.stderr.strip():
+            raise AutonomousTestError(
+                f"prompt-guard emitted hook output: stdout={guard_result.stdout!r} stderr={guard_result.stderr!r}"
+            )
+        state = self.state(state_dir)
+        if state.get("status") != "open":
+            raise AutonomousTestError(f"prompt-guard should preserve cached open state, got: {state}")
+        result.notes.append("Prompt guard used cached state and did not call failing codexbar from the hook path.")
+
     def run_all(self) -> None:
         self.run_scenario("AT-001", "live codexbar smoke", self.scenario_live_codexbar_smoke)
         self.run_scenario("AT-002", "synthetic open poll", self.scenario_synthetic_open_poll)
@@ -459,6 +516,7 @@ print(json.dumps(payload))
         self.run_scenario("AT-006", "global hook config", self.scenario_global_hook_config)
         self.run_scenario("AT-007", "codexbar failure fails open", self.scenario_codexbar_failure_fails_open)
         self.run_scenario("AT-008", "state-only guard avoids live codexbar", self.scenario_state_only_guard_avoids_live_codexbar)
+        self.run_scenario("AT-009", "prompt guard avoids live codexbar", self.scenario_prompt_guard_avoids_live_codexbar)
 
     def write_report(self) -> Path:
         report_path = self.run_dir / "report.md"

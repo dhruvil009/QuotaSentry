@@ -410,10 +410,34 @@ class HookInstallTest(unittest.TestCase):
         self.assertEqual(len(merged["hooks"]["SessionStart"]), 2)
         self.assertIn("UserPromptSubmit", merged["hooks"])
         self.assertIn("PreToolUse", merged["hooks"])
+        session_start_hook = merged["hooks"]["SessionStart"][-1]["hooks"][0]
         user_prompt_command = merged["hooks"]["UserPromptSubmit"][-1]["hooks"][0]["command"]
         pre_tool_command = merged["hooks"]["PreToolUse"][-1]["hooks"][0]["command"]
-        self.assertEqual(user_prompt_command, "/opt/quota-sentry start --quiet; /opt/quota-sentry guard")
+        self.assertFalse(session_start_hook["async"])
+        self.assertEqual(user_prompt_command, "/opt/quota-sentry prompt-guard")
         self.assertEqual(pre_tool_command, "/opt/quota-sentry guard --state-only --no-notify")
+
+    def test_installed_hook_commands_do_not_use_shell_composition(self):
+        merged = core.merge_codex_hooks({}, script_path=Path("/opt/quota-sentry"))
+
+        for entries in merged["hooks"].values():
+            for entry in entries:
+                for hook in entry["hooks"]:
+                    command = hook["command"]
+                    self.assertFalse(hook["async"])
+                    self.assertNotIn(";", command)
+                    self.assertNotIn("&&", command)
+                    self.assertNotIn("|", command)
+                    self.assertNotIn("\n", command)
+
+    def test_user_prompt_hook_is_single_invocation_with_spaced_script_path(self):
+        script_path = Path("/Users/example/Open Development/quotaSentry/scripts/quota-sentry")
+        merged = core.merge_codex_hooks({}, script_path=script_path)
+
+        command = merged["hooks"]["UserPromptSubmit"][-1]["hooks"][0]["command"]
+
+        self.assertEqual(command, "'/Users/example/Open Development/quotaSentry/scripts/quota-sentry' prompt-guard")
+        self.assertEqual(command.count("quota-sentry"), 1)
 
 
 class PollIntervalTest(unittest.TestCase):
@@ -466,6 +490,8 @@ class CodexbarFetchTest(unittest.TestCase):
 
         self.assertEqual(payload[0]["provider"], "codex")
         self.assertIs(calls[0][1]["stdin"], subprocess.DEVNULL)
+        self.assertTrue(calls[0][1]["start_new_session"])
+        self.assertTrue(calls[0][1]["close_fds"])
 
 
 class DaemonStartTest(unittest.TestCase):
@@ -476,11 +502,13 @@ class DaemonStartTest(unittest.TestCase):
 
     def test_start_daemon_detaches_stdin(self):
         popen_kwargs = {}
+        popen_command = {}
 
         class FakeProcess:
             pid = 12345
 
-        def fake_popen(_command, **kwargs):
+        def fake_popen(command, **kwargs):
+            popen_command["value"] = command
             popen_kwargs.update(kwargs)
             return FakeProcess()
 
@@ -490,7 +518,10 @@ class DaemonStartTest(unittest.TestCase):
                 result = cli.start_command(args)
 
         self.assertEqual(result, 0)
+        self.assertIsInstance(popen_command["value"], list)
         self.assertIs(popen_kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(popen_kwargs["start_new_session"])
+        self.assertTrue(popen_kwargs["close_fds"])
 
     def test_quiet_start_suppresses_existing_daemon_message(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -504,6 +535,30 @@ class DaemonStartTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(stdout.getvalue(), "")
+
+    def test_prompt_guard_starts_daemon_quietly_then_uses_state_only_guard(self):
+        args = cli.build_parser().parse_args(["prompt-guard"])
+
+        with mock.patch.object(cli, "start_command", return_value=0) as start, \
+            mock.patch.object(cli, "guard_command", return_value=0) as guard:
+            result = cli.prompt_guard_command(args)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(args.quiet)
+        self.assertTrue(args.state_only)
+        self.assertTrue(args.no_notify)
+        start.assert_called_once_with(args)
+        guard.assert_called_once_with(args)
+
+    def test_prompt_guard_does_not_guard_when_daemon_start_fails(self):
+        args = cli.build_parser().parse_args(["prompt-guard"])
+
+        with mock.patch.object(cli, "start_command", return_value=7), \
+            mock.patch.object(cli, "guard_command") as guard:
+            result = cli.prompt_guard_command(args)
+
+        self.assertEqual(result, 7)
+        guard.assert_not_called()
 
 
 class CliStatusTest(unittest.TestCase):

@@ -278,6 +278,8 @@ def fetch_codexbar_usage(timeout_seconds: int = DEFAULT_CODEXBAR_TIMEOUT_SECONDS
         text=True,
         timeout=timeout_seconds,
         check=False,
+        start_new_session=True,
+        close_fds=True,
     )
     output = completed.stdout or completed.stderr
     if completed.returncode != 0 and not output.strip():
@@ -409,11 +411,11 @@ def merge_codex_hooks(existing: Dict[str, Any], script_path: Path) -> Dict[str, 
     hooks = merged.setdefault("hooks", {})
     script = shlex.quote(str(script_path))
     start_command = f"{script} start --quiet"
-    user_prompt_command = f"{script} start --quiet; {script} guard"
+    user_prompt_command = f"{script} prompt-guard"
     pre_tool_command = f"{script} guard --state-only --no-notify"
 
     additions = {
-        "SessionStart": hook_entry("startup|clear|compact", start_command, True, 30),
+        "SessionStart": hook_entry("startup|clear|compact", start_command, False, 30),
         "UserPromptSubmit": hook_entry("", user_prompt_command, False, 21600),
         "PreToolUse": hook_entry(".*", pre_tool_command, False, 21600),
     }

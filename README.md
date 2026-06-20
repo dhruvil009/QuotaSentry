@@ -10,7 +10,7 @@ Quota Sentry is a local quota guard for agent harnesses. The `v0.1.x` line suppo
 - Blocks at `usedPercent >= 95` until `resetsAt` plus a 60-second buffer.
 - Fails open when `codexbar` is missing, quota JSON is unavailable, or state is stale.
 
-The background daemon does not interrupt an already-running model request. It polls every five minutes by default, tightens its cadence near the quota threshold, and writes state; the synchronous `guard` command is what sleeps when invoked from a Codex hook or wrapper.
+The background daemon does not interrupt an already-running model request. It polls every five minutes by default, tightens its cadence near the quota threshold, and writes state; synchronous Codex hooks only read that cached state and sleep when it says quota is blocked.
 
 Quota Sentry is intentionally conservative for public use: missing tools, malformed quota data, stale state, and unknown quota windows fail open instead of blocking the user.
 
@@ -26,15 +26,15 @@ Run from this plugin root:
 ./scripts/quota-sentry stop
 ```
 
-`status` is intentionally terse for normal use, for example `Quota Sentry: 14% used`. It warns when the saved quota state is stale and the background daemon is not running. Use `status --verbose` to include daemon details. The synchronous `guard` command still self-heals by polling before deciding whether to block unless it is run with `--state-only`.
+`status` is intentionally terse for normal use, for example `Quota Sentry: 14% used`. It warns when the saved quota state is stale and the background daemon is not running. Use `status --verbose` to include daemon details. Manual `guard` still self-heals by polling before deciding whether to block unless it is run with `--state-only`; installed Codex hooks use cache-only guard paths.
 
-`guard` keeps stdout/stderr quiet by default because Codex surfaces hook output back into the TUI after long waits. When it starts waiting, it writes one notice directly to the controlling terminal instead:
+`guard` keeps stdout/stderr quiet by default because Codex surfaces hook output back into the TUI after long waits. When manual `guard` starts waiting, it writes one notice directly to the controlling terminal instead:
 
 ```text
 Quota Sentry: waiting for Codex quota reset until <timestamp>.
 ```
 
-Use `./scripts/quota-sentry guard --verbose` only when running it manually and you want a captured wait message too. Use `--no-notify` to suppress the terminal notice. Use `--state-only` for hook paths that must only read cached daemon state and must not invoke `codexbar`.
+Use `./scripts/quota-sentry guard --verbose` only when running it manually and you want a captured wait message too. Use `--no-notify` to suppress the terminal notice. Use `--state-only` for hook paths that must only read cached daemon state and must not invoke `codexbar`. Installed Codex hooks suppress terminal notices.
 
 Daemon cadence is configurable:
 
@@ -58,9 +58,11 @@ Quota Sentry intentionally does not rely on plugin-local hooks. Current Codex bu
 
 Installed hooks:
 
-- `SessionStart`: starts the background daemon.
-- `UserPromptSubmit`: ensures the daemon is running, then runs live `guard` before a new prompt is accepted.
+- `SessionStart`: starts the background daemon through a synchronous quiet hook. The command returns after spawning the detached daemon; Codex 0.140.0 skips async hooks.
+- `UserPromptSubmit`: runs `prompt-guard`, which quietly ensures the daemon is running and then checks cached state without terminal notices.
 - `PreToolUse`: runs `guard --state-only --no-notify` before tool execution, using only the daemon's latest cached state.
+
+Installed hook commands are intentionally single commands without shell composition. The daemon is the only installed component that performs live `codexbar` polling.
 
 ## State
 

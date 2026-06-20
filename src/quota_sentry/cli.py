@@ -244,6 +244,17 @@ def guard_command(args: argparse.Namespace) -> int:
     )
 
 
+def prompt_guard_command(args: argparse.Namespace) -> int:
+    args.quiet = True
+    start_result = start_command(args)
+    if start_result != 0:
+        return start_result
+
+    args.state_only = True
+    args.no_notify = True
+    return guard_command(args)
+
+
 def install_hook_command(args: argparse.Namespace) -> int:
     hooks_path = Path(args.hooks_path).expanduser().resolve()
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
@@ -303,6 +314,29 @@ def build_parser() -> argparse.ArgumentParser:
     guard_parser.add_argument("--no-notify", action="store_true")
     guard_parser.add_argument("--state-only", action="store_true")
     guard_parser.set_defaults(func=guard_command)
+
+    prompt_guard_parser = subparsers.add_parser("prompt-guard", parents=[common])
+    prompt_guard_parser.add_argument("--interval-seconds", type=int, default=core.DEFAULT_POLL_INTERVAL_SECONDS)
+    prompt_guard_parser.add_argument("--near-threshold-percent", type=int, default=core.DEFAULT_NEAR_THRESHOLD_PERCENT)
+    prompt_guard_parser.add_argument("--near-interval-seconds", type=int, default=core.DEFAULT_NEAR_POLL_INTERVAL_SECONDS)
+    prompt_guard_parser.add_argument(
+        "--critical-threshold-percent",
+        type=int,
+        default=core.DEFAULT_CRITICAL_THRESHOLD_PERCENT,
+    )
+    prompt_guard_parser.add_argument(
+        "--critical-interval-seconds",
+        type=int,
+        default=core.DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS,
+    )
+    prompt_guard_parser.add_argument(
+        "--max-state-age-seconds",
+        type=int,
+        default=core.DEFAULT_MAX_STATE_AGE_SECONDS,
+    )
+    prompt_guard_parser.add_argument("--verbose", action="store_true")
+    prompt_guard_parser.add_argument("--no-notify", action="store_true")
+    prompt_guard_parser.set_defaults(func=prompt_guard_command)
 
     install_parser = subparsers.add_parser("install-hook", parents=[common])
     install_parser.add_argument("--hooks-path", default=str(Path.home() / ".codex" / "hooks.json"))

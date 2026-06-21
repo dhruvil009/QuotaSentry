@@ -99,6 +99,7 @@ def poll_command(args: argparse.Namespace) -> int:
         core.default_state_path(state_dir),
         threshold_percent=args.threshold_percent,
         reset_buffer_seconds=args.reset_buffer_seconds,
+        source=args.source,
     )
     print(status_text(core.state_from_decision(decision)))
     return 0
@@ -124,6 +125,7 @@ def daemon_command(args: argparse.Namespace) -> int:
             state_path,
             threshold_percent=args.threshold_percent,
             reset_buffer_seconds=args.reset_buffer_seconds,
+            source=args.source,
         )
         print(status_text(core.state_from_decision(decision)), flush=True)
         sleep_seconds = core.next_poll_interval_seconds(
@@ -166,6 +168,8 @@ def start_command(args: argparse.Namespace) -> int:
         str(args.threshold_percent),
         "--reset-buffer-seconds",
         str(args.reset_buffer_seconds),
+        "--source",
+        args.source,
         "--interval-seconds",
         str(args.interval_seconds),
         "--near-threshold-percent",
@@ -231,6 +235,7 @@ def guard_command(args: argparse.Namespace) -> int:
             state_path,
             threshold_percent=args.threshold_percent,
             reset_buffer_seconds=args.reset_buffer_seconds,
+            source=args.source,
         )
 
     return core.wait_if_blocked(
@@ -278,6 +283,12 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--state-dir", default=None)
     common.add_argument("--threshold-percent", type=int, default=core.DEFAULT_THRESHOLD_PERCENT)
     common.add_argument("--reset-buffer-seconds", type=int, default=core.DEFAULT_RESET_BUFFER_SECONDS)
+    common.add_argument(
+        "--source",
+        choices=[core.AUTO_SOURCE, core.CODEX_APP_SERVER_SOURCE, core.CODEXBAR_SOURCE],
+        default=core.DEFAULT_USAGE_SOURCE,
+        help="Quota source for live polling. Default: auto.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     poll_parser = subparsers.add_parser("poll", parents=[common])

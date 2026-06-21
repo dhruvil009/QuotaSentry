@@ -10,7 +10,7 @@
   "interface": {
     "displayName": "Quota Sentry",
     "shortDescription": "Monitor Codex quota and wait before the 5-hour window is exhausted.",
-    "longDescription": "Quota Sentry is a local Codex helper that uses codexbar to monitor the Codex 5-hour quota window, runs a background poller every minute, and provides a synchronous guard command for Codex hooks or wrappers to wait until reset when usage reaches the configured threshold.",
+    "longDescription": "Quota Sentry is a local Codex helper that uses Codex app-server rate-limit data to monitor the Codex 5-hour quota window, runs a background poller every five minutes by default, and provides a synchronous guard command for Codex hooks or wrappers to wait until reset when usage reaches the configured threshold.",
     "developerName": "Quota Sentry contributors",
     "category": "Productivity",
     "capabilities": [

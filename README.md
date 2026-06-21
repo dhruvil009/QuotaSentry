@@ -1,14 +1,15 @@
 # Quota Sentry
 
-Quota Sentry is a local quota guard for agent harnesses. The `v0.1.x` line supports Codex by watching the Codex 5-hour usage window via `codexbar` and blocking future Codex lifecycle activity once the configured threshold is reached.
+Quota Sentry is a local quota guard for agent harnesses. The `v0.1.x` line supports Codex by watching the Codex 5-hour usage window through Codex's local app-server interface and blocking future Codex lifecycle activity once the configured threshold is reached.
 
 ## Current Scope
 
 - Codex only in `v0.1.x`; additional harness adapters are welcome.
-- Uses `codexbar usage --provider codex --source cli --format json`.
+- Uses `codex app-server --stdio` by default, reading `account/rateLimits/read`.
+- Supports optional CodexBar fallback with `--source codexbar`.
 - Monitors the 5-hour window (`windowMinutes: 300`) by default.
 - Blocks at `usedPercent >= 95` until `resetsAt` plus a 60-second buffer.
-- Fails open when `codexbar` is missing, quota JSON is unavailable, or state is stale.
+- Fails open when quota source data is missing, malformed, unavailable, or state is stale.
 
 The background daemon does not interrupt an already-running model request. It polls every five minutes by default, tightens its cadence near the quota threshold, and writes state; synchronous Codex hooks only read that cached state and sleep when it says quota is blocked.
 
@@ -34,7 +35,9 @@ Run from this plugin root:
 Quota Sentry: waiting for Codex quota reset until <timestamp>.
 ```
 
-Use `./scripts/quota-sentry guard --verbose` only when running it manually and you want a captured wait message too. Use `--no-notify` to suppress the terminal notice. Use `--state-only` for hook paths that must only read cached daemon state and must not invoke `codexbar`. Installed Codex hooks suppress terminal notices.
+Use `./scripts/quota-sentry guard --verbose` only when running it manually and you want a captured wait message too. Use `--no-notify` to suppress the terminal notice. Use `--state-only` for hook paths that must only read cached daemon state and must not invoke a live quota source. Installed Codex hooks suppress terminal notices.
+
+Live polling accepts `--source auto`, `--source codex-app-server`, or `--source codexbar`. The default `auto` mode tries Codex app-server first and falls back to CodexBar if needed.
 
 Daemon cadence is configurable:
 
@@ -62,7 +65,7 @@ Installed hooks:
 - `UserPromptSubmit`: runs `prompt-guard`, which quietly ensures the daemon is running and then checks cached state without terminal notices.
 - `PreToolUse`: runs `guard --state-only --no-notify` before tool execution, using only the daemon's latest cached state.
 
-Installed hook commands are intentionally single commands without shell composition. The daemon is the only installed component that performs live `codexbar` polling.
+Installed hook commands are intentionally single commands without shell composition. The daemon is the only installed component that performs live quota-source polling.
 
 ## State
 
@@ -100,7 +103,7 @@ Run autonomous E2E tests:
 ./scripts/autonomous-test
 ```
 
-The autonomous harness runs one live `codexbar` smoke poll, then uses synthetic `codexbar` binaries for quota-edge scenarios. It writes a report under `.quota-sentry-runs/`.
+The autonomous harness runs one live Codex quota-source smoke poll, then uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. It writes a report under `.quota-sentry-runs/`.
 
 For clean clones without installed Codex hooks, the global hook scenario is skipped by default. Use `./scripts/autonomous-test --skip-live --require-global-hook` when you specifically need to verify that this checkout is installed in `~/.codex/hooks.json`.
 

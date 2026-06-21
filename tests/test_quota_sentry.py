@@ -38,6 +38,29 @@ def codexbar_payload(used_percent=94, resets_at="2026-06-01T21:23:05Z"):
     ]
 
 
+def app_server_rate_limits_response(
+    primary_used_percent=51,
+    secondary_used_percent=97,
+    primary_resets_at="2026-06-01T21:23:05Z",
+    secondary_resets_at="2026-06-07T21:45:36Z",
+):
+    return {
+        "planType": "plus",
+        "rateLimits": {
+            "primary": {
+                "usedPercent": primary_used_percent,
+                "windowDurationMins": 300,
+                "resetsAt": int(datetime.fromisoformat(primary_resets_at.replace("Z", "+00:00")).timestamp()),
+            },
+            "secondary": {
+                "usedPercent": secondary_used_percent,
+                "windowDurationMins": 10080,
+                "resetsAt": int(datetime.fromisoformat(secondary_resets_at.replace("Z", "+00:00")).timestamp()),
+            },
+        },
+    }
+
+
 class ParseCodexbarUsageTest(unittest.TestCase):
     def test_extract_json_skips_codex_notify_prefix(self):
         payload = core.extract_json(
@@ -473,6 +496,52 @@ class PollIntervalTest(unittest.TestCase):
 
 
 class CodexbarFetchTest(unittest.TestCase):
+    def test_app_server_rate_limits_response_maps_to_codex_usage_payload(self):
+        payload = core.codex_app_server_rate_limits_to_usage(
+            app_server_rate_limits_response(),
+            now=NOW,
+        )
+
+        self.assertEqual(payload[0]["provider"], "codex")
+        self.assertEqual(payload[0]["source"], "codex-app-server")
+        self.assertEqual(payload[0]["usage"]["primary"]["usedPercent"], 51)
+        self.assertEqual(payload[0]["usage"]["primary"]["windowMinutes"], 300)
+        self.assertEqual(payload[0]["usage"]["primary"]["resetsAt"], "2026-06-01T21:23:05Z")
+        self.assertEqual(payload[0]["usage"]["secondary"]["usedPercent"], 97)
+        self.assertEqual(payload[0]["usage"]["secondary"]["windowMinutes"], 10080)
+
+    def test_fetch_codex_usage_auto_prefers_app_server(self):
+        app_payload = codexbar_payload(used_percent=12)
+
+        with mock.patch.object(core, "fetch_codex_app_server_usage", return_value=app_payload) as app_server, \
+            mock.patch.object(core, "fetch_codexbar_usage") as codexbar:
+            payload = core.fetch_codex_usage(source="auto")
+
+        self.assertEqual(payload, app_payload)
+        app_server.assert_called_once()
+        codexbar.assert_not_called()
+
+    def test_fetch_codex_usage_auto_falls_back_to_codexbar(self):
+        codexbar_payload_value = codexbar_payload(used_percent=43)
+
+        with mock.patch.object(core, "fetch_codex_app_server_usage", side_effect=RuntimeError("app-server failed")), \
+            mock.patch.object(core, "fetch_codexbar_usage", return_value=codexbar_payload_value) as codexbar:
+            payload = core.fetch_codex_usage(source="auto")
+
+        self.assertEqual(payload, codexbar_payload_value)
+        codexbar.assert_called_once()
+
+    def test_fetch_codex_usage_can_force_codexbar(self):
+        codexbar_payload_value = codexbar_payload(used_percent=44)
+
+        with mock.patch.object(core, "fetch_codex_app_server_usage") as app_server, \
+            mock.patch.object(core, "fetch_codexbar_usage", return_value=codexbar_payload_value) as codexbar:
+            payload = core.fetch_codex_usage(source="codexbar")
+
+        self.assertEqual(payload, codexbar_payload_value)
+        app_server.assert_not_called()
+        codexbar.assert_called_once()
+
     def test_fetch_codexbar_usage_detaches_stdin(self):
         calls = []
 
@@ -499,6 +568,7 @@ class DaemonStartTest(unittest.TestCase):
         args = cli.build_parser().parse_args(["start"])
 
         self.assertEqual(args.interval_seconds, 300)
+        self.assertEqual(args.source, "auto")
 
     def test_start_daemon_detaches_stdin(self):
         popen_kwargs = {}
@@ -513,12 +583,16 @@ class DaemonStartTest(unittest.TestCase):
             return FakeProcess()
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            args = cli.build_parser().parse_args(["start", "--quiet", "--state-dir", temp_dir])
+            args = cli.build_parser().parse_args(
+                ["start", "--quiet", "--state-dir", temp_dir, "--source", "codex-app-server"]
+            )
             with mock.patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
                 result = cli.start_command(args)
 
         self.assertEqual(result, 0)
         self.assertIsInstance(popen_command["value"], list)
+        self.assertIn("--source", popen_command["value"])
+        self.assertIn("codex-app-server", popen_command["value"])
         self.assertIs(popen_kwargs["stdin"], subprocess.DEVNULL)
         self.assertTrue(popen_kwargs["start_new_session"])
         self.assertTrue(popen_kwargs["close_fds"])
@@ -646,8 +720,9 @@ class AutonomousHarnessTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("AT-001 live codexbar smoke", result.stdout)
-        self.assertIn("AT-006 global hook config", result.stdout)
+        self.assertIn("AT-001 live Codex quota source smoke", result.stdout)
+        self.assertIn("AT-007 global hook config", result.stdout)
+        self.assertIn("AT-011 auto source falls back to CodexBar", result.stdout)
 
 
 if __name__ == "__main__":

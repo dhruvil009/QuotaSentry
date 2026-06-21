@@ -1,7 +1,9 @@
 import json
 import os
+import queue
 import shlex
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -10,7 +12,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 DEFAULT_PROVIDER = "codex"
-DEFAULT_SOURCE = "cli"
+CODEXBAR_SOURCE = "codexbar"
+CODEX_APP_SERVER_SOURCE = "codex-app-server"
+AUTO_SOURCE = "auto"
+DEFAULT_USAGE_SOURCE = AUTO_SOURCE
+DEFAULT_CODEXBAR_SOURCE = "cli"
 DEFAULT_THRESHOLD_PERCENT = 95
 DEFAULT_WINDOW_MINUTES = 300
 DEFAULT_POLL_INTERVAL_SECONDS = 300
@@ -21,6 +27,7 @@ DEFAULT_CRITICAL_THRESHOLD_PERCENT = 93
 DEFAULT_MAX_STATE_AGE_SECONDS = 420
 DEFAULT_RESET_BUFFER_SECONDS = 60
 DEFAULT_CODEXBAR_TIMEOUT_SECONDS = 30
+DEFAULT_CODEX_APP_SERVER_TIMEOUT_SECONDS = 15
 
 
 @dataclass(frozen=True)
@@ -138,7 +145,7 @@ def parse_codexbar_usage(
     current_time = now or utc_now()
     entry = _codex_entry(payload)
     if not entry:
-        return QuotaDecision(status="unknown", reason="codexbar returned no provider entries")
+        return QuotaDecision(status="unknown", reason="quota source returned no provider entries")
 
     error = entry.get("error")
     if isinstance(error, dict):
@@ -147,11 +154,11 @@ def parse_codexbar_usage(
 
     usage = entry.get("usage")
     if not isinstance(usage, dict):
-        return QuotaDecision(status="unknown", reason="codexbar returned no usage object")
+        return QuotaDecision(status="unknown", reason="quota source returned no usage object")
 
     window = _five_hour_window(usage, window_minutes)
     if not window:
-        return QuotaDecision(status="unknown", reason="codexbar returned no quota window")
+        return QuotaDecision(status="unknown", reason="quota source returned no quota window")
 
     used_percent = window.get("usedPercent")
     resets_at = parse_timestamp(window.get("resetsAt"))
@@ -260,6 +267,165 @@ def extract_json(text: str) -> Any:
     raise ValueError("codexbar output did not contain JSON")
 
 
+def _format_unix_timestamp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    return format_timestamp(datetime.fromtimestamp(seconds, timezone.utc))
+
+
+def _app_server_window_to_usage(window: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(window, dict):
+        return None
+    return {
+        "usedPercent": window.get("usedPercent"),
+        "windowMinutes": window.get("windowDurationMins"),
+        "resetsAt": _format_unix_timestamp(window.get("resetsAt")),
+    }
+
+
+def codex_app_server_rate_limits_to_usage(
+    result: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    rate_limits = result.get("rateLimits") if isinstance(result, dict) else None
+    if not isinstance(rate_limits, dict):
+        rate_limits = {}
+
+    usage: Dict[str, Any] = {
+        "updatedAt": format_timestamp(now or utc_now()),
+        "loginMethod": result.get("planType") if isinstance(result, dict) else None,
+    }
+    for name in ("primary", "secondary", "tertiary"):
+        mapped = _app_server_window_to_usage(rate_limits.get(name))
+        if mapped is not None:
+            usage[name] = mapped
+
+    return [
+        {
+            "provider": DEFAULT_PROVIDER,
+            "source": CODEX_APP_SERVER_SOURCE,
+            "usage": usage,
+        }
+    ]
+
+
+def _write_json_line(stdin: Any, payload: Dict[str, Any]) -> None:
+    stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    stdin.flush()
+
+
+def _read_json_response(
+    output_queue: "queue.Queue[Optional[str]]",
+    request_id: str,
+    deadline: float,
+) -> Dict[str, Any]:
+    while time.monotonic() < deadline:
+        timeout = max(0.1, deadline - time.monotonic())
+        try:
+            line = output_queue.get(timeout=min(0.5, timeout))
+        except queue.Empty:
+            continue
+        if line is None:
+            raise RuntimeError(f"codex app-server closed before {request_id}")
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("id") == request_id:
+            return message
+    raise TimeoutError(f"codex app-server timed out waiting for {request_id}")
+
+
+def _enqueue_output_lines(stdout: Any, output_queue: "queue.Queue[Optional[str]]") -> None:
+    try:
+        if stdout is not None:
+            for line in stdout:
+                output_queue.put(line)
+    finally:
+        output_queue.put(None)
+
+
+def fetch_codex_app_server_usage(
+    timeout_seconds: int = DEFAULT_CODEX_APP_SERVER_TIMEOUT_SECONDS,
+) -> Any:
+    command = ["codex", "app-server", "--stdio"]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+        close_fds=True,
+    )
+    output_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+    reader = threading.Thread(
+        target=_enqueue_output_lines,
+        args=(process.stdout, output_queue),
+        daemon=True,
+    )
+    reader.start()
+
+    try:
+        if process.stdin is None:
+            raise RuntimeError("codex app-server stdin unavailable")
+
+        deadline = time.monotonic() + timeout_seconds
+        _write_json_line(
+            process.stdin,
+            {
+                "id": "quota-sentry-init",
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "quota-sentry",
+                        "title": "Quota Sentry",
+                        "version": "0",
+                    },
+                    "capabilities": {
+                        "experimentalApi": True,
+                        "requestAttestation": False,
+                        "mcpServerOpenaiFormElicitation": False,
+                        "optOutNotificationMethods": [],
+                    },
+                },
+            },
+        )
+        initialize_response = _read_json_response(output_queue, "quota-sentry-init", deadline)
+        if "error" in initialize_response:
+            raise RuntimeError(f"codex app-server initialize failed: {initialize_response['error']}")
+
+        _write_json_line(process.stdin, {"method": "initialized"})
+        _write_json_line(
+            process.stdin,
+            {
+                "id": "quota-sentry-rate-limits",
+                "method": "account/rateLimits/read",
+            },
+        )
+        rate_limits_response = _read_json_response(output_queue, "quota-sentry-rate-limits", deadline)
+        if "error" in rate_limits_response:
+            raise RuntimeError(f"codex app-server rate limit read failed: {rate_limits_response['error']}")
+
+        result = rate_limits_response.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("codex app-server returned no rate limit payload")
+        return codex_app_server_rate_limits_to_usage(result)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+
+
 def fetch_codexbar_usage(timeout_seconds: int = DEFAULT_CODEXBAR_TIMEOUT_SECONDS) -> Any:
     command = [
         "codexbar",
@@ -267,7 +433,7 @@ def fetch_codexbar_usage(timeout_seconds: int = DEFAULT_CODEXBAR_TIMEOUT_SECONDS
         "--provider",
         DEFAULT_PROVIDER,
         "--source",
-        DEFAULT_SOURCE,
+        DEFAULT_CODEXBAR_SOURCE,
         "--format",
         "json",
     ]
@@ -287,16 +453,36 @@ def fetch_codexbar_usage(timeout_seconds: int = DEFAULT_CODEXBAR_TIMEOUT_SECONDS
     return extract_json(output)
 
 
+def fetch_codex_usage(source: str = DEFAULT_USAGE_SOURCE) -> Any:
+    if source == CODEX_APP_SERVER_SOURCE:
+        return fetch_codex_app_server_usage()
+    if source == CODEXBAR_SOURCE:
+        return fetch_codexbar_usage()
+    if source != AUTO_SOURCE:
+        raise ValueError(f"unsupported quota source: {source}")
+
+    try:
+        return fetch_codex_app_server_usage()
+    except Exception as app_server_exc:
+        try:
+            return fetch_codexbar_usage()
+        except Exception as codexbar_exc:
+            raise RuntimeError(
+                f"codex app-server failed: {app_server_exc}; codexbar fallback failed: {codexbar_exc}"
+            ) from codexbar_exc
+
+
 def poll_once(
     state_path: Path,
     threshold_percent: int = DEFAULT_THRESHOLD_PERCENT,
     reset_buffer_seconds: int = DEFAULT_RESET_BUFFER_SECONDS,
-    fetcher: Callable[[], Any] = fetch_codexbar_usage,
+    fetcher: Optional[Callable[[], Any]] = None,
+    source: str = DEFAULT_USAGE_SOURCE,
     now: Optional[datetime] = None,
 ) -> QuotaDecision:
     current_time = now or utc_now()
     try:
-        payload = fetcher()
+        payload = fetcher() if fetcher is not None else fetch_codex_usage(source=source)
         decision = parse_codexbar_usage(
             payload,
             threshold_percent=threshold_percent,
@@ -304,7 +490,7 @@ def poll_once(
             now=current_time,
         )
     except Exception as exc:
-        decision = QuotaDecision(status="unknown", reason=f"codexbar fetch failed: {exc}")
+        decision = QuotaDecision(status="unknown", reason=f"quota fetch failed: {exc}")
     write_state(state_path, decision, now=current_time)
     return decision
 

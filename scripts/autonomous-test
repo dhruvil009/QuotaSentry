@@ -18,15 +18,17 @@ DEFAULT_RUN_ROOT = ROOT / ".quota-sentry-runs"
 
 
 SCENARIOS = [
-    ("AT-001", "live codexbar smoke"),
-    ("AT-002", "synthetic open poll"),
-    ("AT-003", "synthetic blocked guard wait"),
-    ("AT-004", "daemon lifecycle"),
-    ("AT-005", "hook installer temp merge"),
-    ("AT-006", "global hook config"),
-    ("AT-007", "codexbar failure fails open"),
-    ("AT-008", "state-only guard avoids live codexbar"),
-    ("AT-009", "prompt guard avoids live codexbar"),
+    ("AT-001", "live Codex quota source smoke"),
+    ("AT-002", "synthetic Codex app-server poll"),
+    ("AT-003", "synthetic CodexBar open poll"),
+    ("AT-004", "synthetic blocked guard wait"),
+    ("AT-005", "daemon lifecycle"),
+    ("AT-006", "hook installer temp merge"),
+    ("AT-007", "global hook config"),
+    ("AT-008", "CodexBar failure fails open"),
+    ("AT-009", "state-only guard avoids live source"),
+    ("AT-010", "prompt guard avoids live source"),
+    ("AT-011", "auto source falls back to CodexBar"),
 ]
 
 
@@ -60,7 +62,73 @@ class Harness:
         self.results: List[ScenarioResult] = []
         self.fake_bin = run_dir / "fake-bin"
         self.fake_bin.mkdir(parents=True, exist_ok=True)
+        self._write_fake_codex()
         self._write_fake_codexbar()
+
+    def _write_fake_codex(self) -> None:
+        script = self.fake_bin / "codex"
+        script.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+if sys.argv[1:] != ["app-server", "--stdio"]:
+    print("unsupported fake codex invocation", file=sys.stderr)
+    sys.exit(64)
+
+mode = os.environ.get("QUOTA_SENTRY_FAKE_MODE", "app-server-open")
+if mode == "app-server-exit-failure":
+    print("simulated codex app-server failure", file=sys.stderr)
+    sys.exit(3)
+
+used = 17
+reset_delta = 300
+if mode == "app-server-blocked-short":
+    used = 99
+    reset_delta = 2
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+
+    request_id = request.get("id")
+    method = request.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": request_id, "result": {"capabilities": {}}}), flush=True)
+    elif method == "initialized":
+        continue
+    elif method == "account/rateLimits/read":
+        now = int(time.time())
+        print(
+            json.dumps(
+                {
+                    "id": request_id,
+                    "result": {
+                        "planType": "plus",
+                        "rateLimits": {
+                            "primary": {
+                                "usedPercent": used,
+                                "windowDurationMins": 300,
+                                "resetsAt": now + reset_delta,
+                            },
+                            "secondary": {
+                                "usedPercent": 33,
+                                "windowDurationMins": 10080,
+                                "resetsAt": now + 604800,
+                            },
+                        },
+                    },
+                }
+            ),
+            flush=True,
+        )
+"""
+        )
+        script.chmod(0o755)
 
     def _write_fake_codexbar(self) -> None:
         script = self.fake_bin / "codexbar"
@@ -183,7 +251,7 @@ print(json.dumps(payload))
             result.notes.append(str(exc))
         self.results.append(result)
 
-    def scenario_live_codexbar_smoke(self, result: ScenarioResult) -> None:
+    def scenario_live_quota_source_smoke(self, result: ScenarioResult) -> None:
         if self.skip_live:
             result.status = "SKIP"
             result.notes.append("Skipped by --skip-live.")
@@ -192,20 +260,32 @@ print(json.dumps(payload))
         self.run(result, [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)], timeout=60)
         state = self.state(state_dir)
         if state.get("status") not in {"open", "blocked"}:
-            raise AutonomousTestError(f"live codexbar smoke returned unexpected state: {state}")
+            raise AutonomousTestError(f"live quota source smoke returned unexpected state: {state}")
         result.notes.append(f"Live state: {state.get('status')} at {state.get('usedPercent')}% used.")
+
+    def scenario_synthetic_codex_app_server_poll(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "synthetic-app-server"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-open"),
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "open" or state.get("usedPercent") != 17:
+            raise AutonomousTestError(f"expected app-server open 17% state, got: {state}")
+        result.notes.append("Default auto source used the Codex app-server adapter.")
 
     def scenario_synthetic_open_poll(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "synthetic-open"
         self.run(
             result,
-            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir), "--source", "codexbar"],
             env=self.env("notify-open"),
         )
         state = self.state(state_dir)
         if state.get("status") != "open" or state.get("usedPercent") != 12:
             raise AutonomousTestError(f"expected open 12% state, got: {state}")
-        result.notes.append("Open quota state was parsed through a codex notify prefix.")
+        result.notes.append("CodexBar quota state was parsed through a codex notify prefix.")
 
     def scenario_synthetic_blocked_guard_wait(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "blocked-guard"
@@ -216,6 +296,8 @@ print(json.dumps(payload))
                 "poll",
                 "--state-dir",
                 str(state_dir),
+                "--source",
+                "codexbar",
                 "--reset-buffer-seconds",
                 "0",
             ],
@@ -232,6 +314,8 @@ print(json.dumps(payload))
                 "guard",
                 "--state-dir",
                 str(state_dir),
+                "--source",
+                "codexbar",
                 "--interval-seconds",
                 "1",
                 "--max-state-age-seconds",
@@ -250,6 +334,8 @@ print(json.dumps(payload))
                 "poll",
                 "--state-dir",
                 str(quiet_state_dir),
+                "--source",
+                "codexbar",
                 "--reset-buffer-seconds",
                 "0",
             ],
@@ -264,6 +350,8 @@ print(json.dumps(payload))
                 "guard",
                 "--state-dir",
                 str(quiet_state_dir),
+                "--source",
+                "codexbar",
                 "--interval-seconds",
                 "1",
                 "--max-state-age-seconds",
@@ -297,6 +385,8 @@ print(json.dumps(payload))
                 "start",
                 "--state-dir",
                 str(state_dir),
+                "--source",
+                "codexbar",
                 "--interval-seconds",
                 "1",
             ],
@@ -423,7 +513,7 @@ print(json.dumps(payload))
         state_dir = self.run_dir / "codexbar-failure"
         self.run(
             result,
-            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir), "--source", "codexbar"],
             env=self.env("exit-failure"),
         )
         state = self.state(state_dir)
@@ -436,6 +526,8 @@ print(json.dumps(payload))
                 "guard",
                 "--state-dir",
                 str(state_dir),
+                "--source",
+                "codexbar",
                 "--interval-seconds",
                 "1",
                 "--max-state-age-seconds",
@@ -446,11 +538,11 @@ print(json.dumps(payload))
         )
         result.notes.append("Failed codexbar poll wrote unknown state and guard returned open.")
 
-    def scenario_state_only_guard_avoids_live_codexbar(self, result: ScenarioResult) -> None:
+    def scenario_state_only_guard_avoids_live_source(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "state-only"
         self.run(
             result,
-            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir), "--source", "codexbar"],
             env=self.env("open"),
         )
         guard_result = self.run(
@@ -475,13 +567,13 @@ print(json.dumps(payload))
         state = self.state(state_dir)
         if state.get("status") != "open":
             raise AutonomousTestError(f"state-only guard should preserve cached open state, got: {state}")
-        result.notes.append("State-only guard used cached state and did not call failing codexbar.")
+        result.notes.append("State-only guard used cached state and did not call a failing live source.")
 
-    def scenario_prompt_guard_avoids_live_codexbar(self, result: ScenarioResult) -> None:
+    def scenario_prompt_guard_avoids_live_source(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "prompt-guard"
         self.run(
             result,
-            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir), "--source", "codexbar"],
             env=self.env("open"),
         )
         (state_dir / "quota-sentry.pid").write_text(f"{os.getpid()}\n")
@@ -505,18 +597,32 @@ print(json.dumps(payload))
         state = self.state(state_dir)
         if state.get("status") != "open":
             raise AutonomousTestError(f"prompt-guard should preserve cached open state, got: {state}")
-        result.notes.append("Prompt guard used cached state and did not call failing codexbar from the hook path.")
+        result.notes.append("Prompt guard used cached state and did not call a failing live source from the hook path.")
+
+    def scenario_auto_source_falls_back_to_codexbar(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "auto-fallback"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-exit-failure"),
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "open" or state.get("usedPercent") != 12:
+            raise AutonomousTestError(f"expected CodexBar fallback open 12% state, got: {state}")
+        result.notes.append("Auto source failed over from Codex app-server to CodexBar.")
 
     def run_all(self) -> None:
-        self.run_scenario("AT-001", "live codexbar smoke", self.scenario_live_codexbar_smoke)
-        self.run_scenario("AT-002", "synthetic open poll", self.scenario_synthetic_open_poll)
-        self.run_scenario("AT-003", "synthetic blocked guard wait", self.scenario_synthetic_blocked_guard_wait)
-        self.run_scenario("AT-004", "daemon lifecycle", self.scenario_daemon_lifecycle)
-        self.run_scenario("AT-005", "hook installer temp merge", self.scenario_hook_installer_temp_merge)
-        self.run_scenario("AT-006", "global hook config", self.scenario_global_hook_config)
-        self.run_scenario("AT-007", "codexbar failure fails open", self.scenario_codexbar_failure_fails_open)
-        self.run_scenario("AT-008", "state-only guard avoids live codexbar", self.scenario_state_only_guard_avoids_live_codexbar)
-        self.run_scenario("AT-009", "prompt guard avoids live codexbar", self.scenario_prompt_guard_avoids_live_codexbar)
+        self.run_scenario("AT-001", "live Codex quota source smoke", self.scenario_live_quota_source_smoke)
+        self.run_scenario("AT-002", "synthetic Codex app-server poll", self.scenario_synthetic_codex_app_server_poll)
+        self.run_scenario("AT-003", "synthetic CodexBar open poll", self.scenario_synthetic_open_poll)
+        self.run_scenario("AT-004", "synthetic blocked guard wait", self.scenario_synthetic_blocked_guard_wait)
+        self.run_scenario("AT-005", "daemon lifecycle", self.scenario_daemon_lifecycle)
+        self.run_scenario("AT-006", "hook installer temp merge", self.scenario_hook_installer_temp_merge)
+        self.run_scenario("AT-007", "global hook config", self.scenario_global_hook_config)
+        self.run_scenario("AT-008", "CodexBar failure fails open", self.scenario_codexbar_failure_fails_open)
+        self.run_scenario("AT-009", "state-only guard avoids live source", self.scenario_state_only_guard_avoids_live_source)
+        self.run_scenario("AT-010", "prompt guard avoids live source", self.scenario_prompt_guard_avoids_live_source)
+        self.run_scenario("AT-011", "auto source falls back to CodexBar", self.scenario_auto_source_falls_back_to_codexbar)
 
     def write_report(self) -> Path:
         report_path = self.run_dir / "report.md"
@@ -564,7 +670,7 @@ print(json.dumps(payload))
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Quota Sentry autonomous E2E tests.")
     parser.add_argument("--list", action="store_true", help="List scenarios without running them.")
-    parser.add_argument("--skip-live", action="store_true", help="Skip the real codexbar smoke scenario.")
+    parser.add_argument("--skip-live", action="store_true", help="Skip the real Codex quota source smoke scenario.")
     parser.add_argument("--require-global-hook", action="store_true", help="Fail if ~/.codex/hooks.json does not reference this checkout.")
     parser.add_argument("--run-dir", default=None, help="Directory for test artifacts.")
     parser.add_argument("--cleanup", action="store_true", help="Remove run artifacts after a successful run.")

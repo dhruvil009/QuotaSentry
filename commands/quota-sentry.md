@@ -12,10 +12,10 @@ The user invoked this command with: $ARGUMENTS
 
 Use this command to help the user manage Quota Sentry from the plugin root.
 
-1. Confirm `codexbar` is available:
+1. Confirm `codex` is available:
 
 ```bash
-command -v codexbar
+command -v codex
 ```
 
 2. If the user asks for status, run:
@@ -56,10 +56,12 @@ After hook installation, tell the user to restart Codex if the current session d
 ./scripts/autonomous-test
 ```
 
+`poll`, `start`, and `guard` accept `--source auto|codex-app-server|codexbar`. Default `auto` uses Codex app-server first and falls back to CodexBar.
+
 `guard` should keep stdout/stderr quiet in hooks. It writes one wait notice directly to the controlling terminal when waiting starts. Use `./scripts/quota-sentry guard --verbose` only for manual debugging.
 
 Current hook model:
 
 - `SessionStart` runs `start --quiet` synchronously; the command returns after spawning the detached daemon.
 - `UserPromptSubmit` runs `prompt-guard`, which starts the daemon quietly and then checks cached state without terminal notices.
-- `PreToolUse` runs `guard --state-only --no-notify` so tool hooks only read cached state and never invoke `codexbar`.
+- `PreToolUse` runs `guard --state-only --no-notify` so tool hooks only read cached state and never invoke a live quota source.

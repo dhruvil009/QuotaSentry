@@ -24,7 +24,7 @@ No package install is required for the core test suite; the project currently us
 
 ## Adding Harness Support
 
-Codex support lives in the current `codexbar`-based flow. New harness integrations should be added as isolated adapters, scripts, commands, or plugin surfaces rather than by hardcoding another harness into the Codex path.
+Codex support uses `codex app-server --stdio` as the primary source and keeps CodexBar as an optional fallback adapter. New harness integrations should be added as isolated adapters, scripts, commands, or plugin surfaces rather than by hardcoding another harness into the Codex path.
 
 When adding support for a harness such as Claude Code or OpenCode:
 
@@ -51,7 +51,7 @@ Use the autonomous E2E harness before changing hook behavior, daemon behavior, o
 ./scripts/autonomous-test
 ```
 
-The autonomous harness performs one live `codexbar` smoke check and uses synthetic `codexbar` binaries for quota-edge scenarios. If you need to avoid the live check, run:
+The autonomous harness performs one live Codex quota-source smoke check and uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. If you need to avoid the live check, run:
 
 ```bash
 ./scripts/autonomous-test --skip-live
@@ -73,7 +73,7 @@ Expected behavior:
 - `guard` may write one wait notice directly to the controlling terminal.
 - `guard --verbose` is for manual debugging only.
 - `QUOTA_SENTRY_DISABLE=1` bypasses blocking.
-- Installed Codex hook paths must not perform live `codexbar` polling.
+- Installed Codex hook paths must not perform live quota-source polling.
 - Installed Codex hook paths must not open or write to `/dev/tty`; use `--no-notify` or `prompt-guard` for hook mode.
 - Installed hook commands must be single commands, not shell-composed chains with `;`, `&&`, or pipes.
 - Installed Codex hooks should be synchronous commands; Codex 0.140.0 skips async hooks.
@@ -100,7 +100,7 @@ Before opening or merging a change:
 
 - Run the unit suite.
 - Run `./scripts/autonomous-test --skip-live` for logic-only changes.
-- Run full `./scripts/autonomous-test` for changes that touch `codexbar` parsing, hooks, daemon lifecycle, or user-visible wait behavior.
+- Run full `./scripts/autonomous-test` for changes that touch quota-source adapters, hooks, daemon lifecycle, or user-visible wait behavior.
 - For new harnesses, include synthetic E2E tests for below-threshold, blocked, reset, stale-state, missing-binary, and malformed-quota cases.
 - Keep generated `.quota-sentry-runs/` artifacts out of commits.
 - Do not commit local paths, personal tokens, credentials, cookies, or provider account data.

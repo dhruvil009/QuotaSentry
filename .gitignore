@@ -1,1 +1,6 @@
 docs/*
+!docs/launch.md
+!docs/demo/
+!docs/demo/**
+!docs/assets/
+!docs/assets/**

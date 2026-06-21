@@ -1,23 +1,95 @@
 # Quota Sentry
 
-Quota Sentry is a local quota guard for agent harnesses. The `v0.1.x` line supports Codex by watching the Codex 5-hour usage window through Codex's local app-server interface and blocking future Codex lifecycle activity once the configured threshold is reached.
+[![License](https://img.shields.io/github/license/dhruvil009/QuotaSentry)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/dhruvil009/QuotaSentry?style=social)](https://github.com/dhruvil009/QuotaSentry/stargazers)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 
-## Current Scope
+Quota Sentry is a local circuit breaker for Codex quota. It watches your 5-hour usage window and pauses new Codex activity before you burn through the limit.
 
-- Codex only in `v0.1.x`; additional harness adapters are welcome.
+It is for the moment when a long agent session keeps going, your quota window is nearly spent, and the next prompt or tool call should wait instead of wasting the last few percent.
+
+```text
+Quota Sentry: 94% used
+Quota Sentry: waiting for Codex quota reset until 2026-06-01T21:24:05Z.
+```
+
+## Why Use It
+
+- Avoid accidentally exhausting a paid or rate-limited Codex window.
+- Keep long-running Codex sessions from starting new work when the 5-hour quota is already near the threshold.
+- Fail open when quota data is unavailable, malformed, stale, or unsafe to trust.
+- Keep hooks quiet so Codex does not flood the TUI with guard output after a long wait.
+
+## Quick Start
+
+Quota Sentry currently runs from this checkout. Packaging is intentionally not promised until the install path is real.
+
+```bash
+git clone https://github.com/dhruvil009/QuotaSentry.git
+cd QuotaSentry
+
+./scripts/quota-sentry status
+./scripts/quota-sentry poll
+./scripts/quota-sentry start
+./scripts/quota-sentry install-hook
+```
+
+Restart Codex after installing hooks if the current session does not pick up the new global hook config.
+
+To bypass blocking for a session:
+
+```bash
+export QUOTA_SENTRY_DISABLE=1
+```
+
+## Demo Recording
+
+The terminal demo is scripted so the launch GIF can be reproduced without touching live Codex quota:
+
+```bash
+bash docs/demo/quota-sentry-demo.sh
+vhs docs/demo/quota-sentry-demo.tape
+```
+
+## How It Works
+
+```mermaid
+flowchart LR
+    codex[Codex session] --> hooks[Global Codex hooks]
+    hooks --> promptGuard[prompt-guard]
+    hooks --> toolGuard[guard --state-only --no-notify]
+
+    daemon[Quota Sentry daemon] --> source{Quota source}
+    source --> appServer[codex app-server<br/>account/rateLimits/read]
+    source --> codexBar[CodexBar fallback]
+    daemon --> state[(~/.cache/quota-sentry/state.json)]
+
+    promptGuard --> state
+    toolGuard --> state
+    state --> decision{Fresh blocked state?}
+    decision -->|yes| wait[Wait until resetsAt + 60s]
+    decision -->|no, stale, or unknown| open[Allow Codex]
+```
+
+The daemon polls quota in the background and writes a cached decision. Codex hooks read that cached state synchronously before new prompt and tool activity. Hook paths do not invoke live quota sources.
+
+The daemon does not interrupt an already-running model request. It only affects future guarded Codex lifecycle activity.
+
+## What It Watches
+
+The `v0.1.x` line supports Codex only:
+
 - Uses `codex app-server --stdio` by default, reading `account/rateLimits/read`.
-- Supports optional CodexBar fallback with `--source codexbar`.
+- Falls back to CodexBar when `--source auto` cannot use the app-server path.
 - Monitors the 5-hour window (`windowMinutes: 300`) by default.
 - Blocks at `usedPercent >= 95` until `resetsAt` plus a 60-second buffer.
 - Fails open when quota source data is missing, malformed, unavailable, or state is stale.
 
-The background daemon does not interrupt an already-running model request. It polls every five minutes by default, tightens its cadence near the quota threshold, and writes state; synchronous Codex hooks only read that cached state and sleep when it says quota is blocked.
-
-Quota Sentry is intentionally conservative for public use: missing tools, malformed quota data, stale state, and unknown quota windows fail open instead of blocking the user.
+The background daemon polls every five minutes by default, tightens its cadence near the quota threshold, and writes state for synchronous hooks to read.
 
 ## Commands
 
-Run from this plugin root:
+Run from the repository root:
 
 ```bash
 ./scripts/quota-sentry poll
@@ -27,9 +99,17 @@ Run from this plugin root:
 ./scripts/quota-sentry stop
 ```
 
-`status` is intentionally terse for normal use, for example `Quota Sentry: 14% used`. It warns when the saved quota state is stale and the background daemon is not running. Use `status --verbose` to include daemon details. Manual `guard` still self-heals by polling before deciding whether to block unless it is run with `--state-only`; installed Codex hooks use cache-only guard paths.
+`status` is intentionally terse for normal use:
 
-`guard` keeps stdout/stderr quiet by default because Codex surfaces hook output back into the TUI after long waits. When manual `guard` starts waiting, it writes one notice directly to the controlling terminal instead:
+```text
+Quota Sentry: 14% used
+```
+
+It warns when the saved quota state is stale and the background daemon is not running. Use `status --verbose` to include daemon details.
+
+Manual `guard` self-heals by polling before deciding whether to block unless it is run with `--state-only`. Installed Codex hooks use cache-only guard paths.
+
+`guard` keeps stdout and stderr quiet by default because Codex surfaces hook output back into the TUI after long waits. When manual `guard` starts waiting, it writes one notice directly to the controlling terminal:
 
 ```text
 Quota Sentry: waiting for Codex quota reset until <timestamp>.
@@ -47,6 +127,8 @@ Daemon cadence is configurable:
 ./scripts/quota-sentry start --critical-threshold-percent 93 --critical-interval-seconds 30
 ```
 
+## Install Codex Hooks
+
 Install global Codex hooks:
 
 ```bash
@@ -54,8 +136,6 @@ Install global Codex hooks:
 ```
 
 That command merges Quota Sentry hooks into `~/.codex/hooks.json` and writes a `.bak` backup if a hooks file already exists. Restart Codex after installing hooks if the current session does not pick them up.
-
-## Hook Model
 
 Quota Sentry intentionally does not rely on plugin-local hooks. Current Codex builds expose global hooks, but plugin-scoped hooks are not a reliable runtime surface yet. The installer writes absolute script paths into `~/.codex/hooks.json`.
 
@@ -80,14 +160,6 @@ Files:
 - `state.json`: latest quota decision.
 - `quota-sentry.pid`: daemon pid.
 - `quota-sentry.log`: daemon output.
-
-## Bypass
-
-Set this environment variable to bypass synchronous blocking:
-
-```bash
-export QUOTA_SENTRY_DISABLE=1
-```
 
 ## Development
 

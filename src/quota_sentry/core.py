@@ -15,10 +15,14 @@ DEFAULT_PROVIDER = "codex"
 CODEXBAR_SOURCE = "codexbar"
 CODEX_APP_SERVER_SOURCE = "codex-app-server"
 AUTO_SOURCE = "auto"
+WEEKLY_MODE_ADVISORY = "advisory"
+WEEKLY_MODE_HARD_BLOCK = "hard-block"
 DEFAULT_USAGE_SOURCE = AUTO_SOURCE
 DEFAULT_CODEXBAR_SOURCE = "cli"
 DEFAULT_THRESHOLD_PERCENT = 95
 DEFAULT_WINDOW_MINUTES = 300
+DEFAULT_WEEKLY_WINDOW_MINUTES = 10080
+DEFAULT_WEEKLY_THRESHOLD_PERCENT = 99
 DEFAULT_POLL_INTERVAL_SECONDS = 300
 DEFAULT_NEAR_POLL_INTERVAL_SECONDS = 60
 DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS = 30
@@ -31,6 +35,20 @@ DEFAULT_CODEX_APP_SERVER_TIMEOUT_SECONDS = 15
 
 
 @dataclass(frozen=True)
+class QuotaConfig:
+    weekly_mode: str = WEEKLY_MODE_ADVISORY
+    weekly_threshold_percent: int = DEFAULT_WEEKLY_THRESHOLD_PERCENT
+
+
+@dataclass(frozen=True)
+class QuotaWindow:
+    name: str
+    used_percent: int
+    window_minutes: Optional[int]
+    resets_at: datetime
+
+
+@dataclass(frozen=True)
 class QuotaDecision:
     status: str
     reason: str
@@ -39,6 +57,10 @@ class QuotaDecision:
     resets_at: Optional[datetime] = None
     blocked_until: Optional[datetime] = None
     fail_open: bool = True
+    primary_window: Optional[QuotaWindow] = None
+    weekly_window: Optional[QuotaWindow] = None
+    blocked_window: Optional[str] = None
+    weekly_hard_block_enabled: bool = False
 
 
 def utc_now() -> datetime:
@@ -71,6 +93,17 @@ def cache_dir() -> Path:
     return Path.home() / ".cache" / "quota-sentry"
 
 
+def config_dir() -> Path:
+    root = os.environ.get("XDG_CONFIG_HOME")
+    if root:
+        return Path(root) / "quota-sentry"
+    return Path.home() / ".config" / "quota-sentry"
+
+
+def default_config_path(config_root: Optional[Path] = None) -> Path:
+    return (config_root or config_dir()) / "config.json"
+
+
 def default_state_path(state_dir: Optional[Path] = None) -> Path:
     return (state_dir or cache_dir()) / "state.json"
 
@@ -81,6 +114,59 @@ def default_pid_path(state_dir: Optional[Path] = None) -> Path:
 
 def default_log_path(state_dir: Optional[Path] = None) -> Path:
     return (state_dir or cache_dir()) / "quota-sentry.log"
+
+
+def _valid_weekly_mode(value: Any) -> str:
+    if isinstance(value, str) and value in {WEEKLY_MODE_ADVISORY, WEEKLY_MODE_HARD_BLOCK}:
+        return value
+    return WEEKLY_MODE_ADVISORY
+
+
+def _valid_percent(value: Any, default: int) -> int:
+    try:
+        percent = int(value)
+    except (TypeError, ValueError):
+        return default
+    if percent < 1 or percent > 100:
+        return default
+    return percent
+
+
+def config_from_payload(payload: Any) -> QuotaConfig:
+    if not isinstance(payload, dict):
+        return QuotaConfig()
+    return QuotaConfig(
+        weekly_mode=_valid_weekly_mode(payload.get("weeklyMode")),
+        weekly_threshold_percent=_valid_percent(
+            payload.get("weeklyThresholdPercent"),
+            DEFAULT_WEEKLY_THRESHOLD_PERCENT,
+        ),
+    )
+
+
+def config_to_payload(config: QuotaConfig) -> Dict[str, Any]:
+    return {
+        "weeklyMode": _valid_weekly_mode(config.weekly_mode),
+        "weeklyThresholdPercent": _valid_percent(
+            config.weekly_threshold_percent,
+            DEFAULT_WEEKLY_THRESHOLD_PERCENT,
+        ),
+    }
+
+
+def read_config(path: Optional[Path] = None) -> QuotaConfig:
+    config_path = path or default_config_path()
+    try:
+        return config_from_payload(json.loads(config_path.read_text()))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return QuotaConfig()
+
+
+def write_config(path: Path, config: QuotaConfig) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(config_to_payload(config), indent=2, sort_keys=True) + "\n")
+    temp_path.replace(path)
 
 
 def emit_terminal_notice(message: str) -> None:
@@ -135,14 +221,84 @@ def _five_hour_window(usage: Dict[str, Any], window_minutes: int) -> Optional[Di
     return primary if isinstance(primary, dict) else None
 
 
+def _window_by_minutes(usage: Dict[str, Any], window_minutes: int) -> Optional[Dict[str, Any]]:
+    for _name, window in _window_candidates(usage):
+        if window.get("windowMinutes") == window_minutes:
+            return window
+    return None
+
+
+def _parse_quota_window(window: Dict[str, Any], name: str) -> Tuple[Optional[QuotaWindow], Optional[str]]:
+    used_percent = window.get("usedPercent")
+    resets_at = parse_timestamp(window.get("resetsAt"))
+    actual_window_minutes = window.get("windowMinutes")
+
+    if used_percent is None:
+        return None, "quota window is missing usedPercent"
+    if resets_at is None:
+        return None, "quota window has missing or invalid resetsAt"
+
+    try:
+        used = int(used_percent)
+    except (TypeError, ValueError):
+        return None, "quota window has invalid usedPercent"
+
+    return (
+        QuotaWindow(
+            name=name,
+            used_percent=used,
+            window_minutes=actual_window_minutes,
+            resets_at=resets_at,
+        ),
+        None,
+    )
+
+
+def _window_state(window: Optional[QuotaWindow]) -> Optional[Dict[str, Any]]:
+    if window is None:
+        return None
+    return {
+        "usedPercent": window.used_percent,
+        "windowMinutes": window.window_minutes,
+        "resetsAt": format_timestamp(window.resets_at),
+    }
+
+
+def _blocked_decision(
+    window: QuotaWindow,
+    reset_buffer_seconds: int,
+    blocked_window: str,
+    primary_window: Optional[QuotaWindow],
+    weekly_window: Optional[QuotaWindow],
+    weekly_hard_block_enabled: bool,
+) -> QuotaDecision:
+    blocked_until = window.resets_at + timedelta(seconds=reset_buffer_seconds)
+    return QuotaDecision(
+        status="blocked",
+        reason=f"{window.used_percent}% of the {window.window_minutes}-minute Codex quota is used",
+        used_percent=window.used_percent,
+        window_minutes=window.window_minutes,
+        resets_at=window.resets_at,
+        blocked_until=blocked_until,
+        fail_open=False,
+        primary_window=primary_window,
+        weekly_window=weekly_window,
+        blocked_window=blocked_window,
+        weekly_hard_block_enabled=weekly_hard_block_enabled,
+    )
+
+
 def parse_codexbar_usage(
     payload: Any,
     threshold_percent: int = DEFAULT_THRESHOLD_PERCENT,
     reset_buffer_seconds: int = DEFAULT_RESET_BUFFER_SECONDS,
     now: Optional[datetime] = None,
     window_minutes: int = DEFAULT_WINDOW_MINUTES,
+    quota_config: Optional[QuotaConfig] = None,
 ) -> QuotaDecision:
     current_time = now or utc_now()
+    config = quota_config or QuotaConfig()
+    weekly_hard_block_enabled = config.weekly_mode == WEEKLY_MODE_HARD_BLOCK
     entry = _codex_entry(payload)
     if not entry:
         return QuotaDecision(status="unknown", reason="quota source returned no provider entries")
@@ -160,49 +316,63 @@ def parse_codexbar_usage(
     if not window:
         return QuotaDecision(status="unknown", reason="quota source returned no quota window")
 
-    used_percent = window.get("usedPercent")
-    resets_at = parse_timestamp(window.get("resetsAt"))
-    actual_window_minutes = window.get("windowMinutes")
+    primary_window, primary_error = _parse_quota_window(window, "primary")
+    if primary_error or primary_window is None:
+        return QuotaDecision(status="unknown", reason=primary_error or "quota source returned no quota window")
 
-    if used_percent is None:
-        return QuotaDecision(status="unknown", reason="quota window is missing usedPercent")
-    if resets_at is None:
-        return QuotaDecision(status="unknown", reason="quota window has missing or invalid resetsAt")
+    weekly_window = None
+    weekly_source_window = _window_by_minutes(usage, DEFAULT_WEEKLY_WINDOW_MINUTES)
+    if weekly_source_window:
+        weekly_window, _weekly_error = _parse_quota_window(weekly_source_window, "weekly")
 
-    try:
-        used = int(used_percent)
-    except (TypeError, ValueError):
-        return QuotaDecision(status="unknown", reason="quota window has invalid usedPercent")
+    blocked_candidates: List[Tuple[str, QuotaWindow]] = []
+    if primary_window.resets_at > current_time and primary_window.used_percent >= threshold_percent:
+        blocked_candidates.append(("primary", primary_window))
+    if (
+        weekly_hard_block_enabled
+        and weekly_window is not None
+        and weekly_window.resets_at > current_time
+        and weekly_window.used_percent >= config.weekly_threshold_percent
+    ):
+        blocked_candidates.append(("weekly", weekly_window))
 
-    if resets_at <= current_time:
+    if blocked_candidates:
+        blocked_window, blocked_quota_window = max(
+            blocked_candidates,
+            key=lambda candidate: candidate[1].resets_at,
+        )
+        return _blocked_decision(
+            blocked_quota_window,
+            reset_buffer_seconds=reset_buffer_seconds,
+            blocked_window=blocked_window,
+            primary_window=primary_window,
+            weekly_window=weekly_window,
+            weekly_hard_block_enabled=weekly_hard_block_enabled,
+        )
+
+    if primary_window.resets_at <= current_time:
         return QuotaDecision(
             status="open",
             reason="quota reset time has passed",
-            used_percent=used,
-            window_minutes=actual_window_minutes,
-            resets_at=resets_at,
+            used_percent=primary_window.used_percent,
+            window_minutes=primary_window.window_minutes,
+            resets_at=primary_window.resets_at,
             fail_open=False,
-        )
-
-    if used >= threshold_percent:
-        blocked_until = resets_at + timedelta(seconds=reset_buffer_seconds)
-        return QuotaDecision(
-            status="blocked",
-            reason=f"{used}% of the {actual_window_minutes}-minute Codex quota is used",
-            used_percent=used,
-            window_minutes=actual_window_minutes,
-            resets_at=resets_at,
-            blocked_until=blocked_until,
-            fail_open=False,
+            primary_window=primary_window,
+            weekly_window=weekly_window,
+            weekly_hard_block_enabled=weekly_hard_block_enabled,
         )
 
     return QuotaDecision(
         status="open",
-        reason=f"{used}% of the {actual_window_minutes}-minute Codex quota is used",
-        used_percent=used,
-        window_minutes=actual_window_minutes,
-        resets_at=resets_at,
+        reason=f"{primary_window.used_percent}% of the {primary_window.window_minutes}-minute Codex quota is used",
+        used_percent=primary_window.used_percent,
+        window_minutes=primary_window.window_minutes,
+        resets_at=primary_window.resets_at,
         fail_open=False,
+        primary_window=primary_window,
+        weekly_window=weekly_window,
+        weekly_hard_block_enabled=weekly_hard_block_enabled,
     )
 
 
@@ -217,6 +387,10 @@ def state_from_decision(decision: QuotaDecision, now: Optional[datetime] = None)
         "blockedUntil": format_timestamp(decision.blocked_until),
         "failOpen": decision.fail_open,
         "updatedAt": format_timestamp(current_time),
+        "primary": _window_state(decision.primary_window),
+        "weekly": _window_state(decision.weekly_window),
+        "blockedWindow": decision.blocked_window,
+        "weeklyHardBlockEnabled": decision.weekly_hard_block_enabled,
     }
 
 
@@ -478,9 +652,12 @@ def poll_once(
     reset_buffer_seconds: int = DEFAULT_RESET_BUFFER_SECONDS,
     fetcher: Optional[Callable[[], Any]] = None,
     source: str = DEFAULT_USAGE_SOURCE,
+    config_path: Optional[Path] = None,
+    quota_config: Optional[QuotaConfig] = None,
     now: Optional[datetime] = None,
 ) -> QuotaDecision:
     current_time = now or utc_now()
+    active_config = quota_config or read_config(config_path)
     try:
         payload = fetcher() if fetcher is not None else fetch_codex_usage(source=source)
         decision = parse_codexbar_usage(
@@ -488,6 +665,7 @@ def poll_once(
             threshold_percent=threshold_percent,
             reset_buffer_seconds=reset_buffer_seconds,
             now=current_time,
+            quota_config=active_config,
         )
     except Exception as exc:
         decision = QuotaDecision(status="unknown", reason=f"quota fetch failed: {exc}")
@@ -507,9 +685,15 @@ def next_poll_interval_seconds(
     near_interval = max(1, int(near_interval_seconds))
     critical_interval = max(1, int(critical_interval_seconds))
 
-    used = decision.used_percent
-    if used is None:
+    used_values = [decision.used_percent]
+    if decision.primary_window is not None:
+        used_values.append(decision.primary_window.used_percent)
+    if decision.weekly_hard_block_enabled and decision.weekly_window is not None:
+        used_values.append(decision.weekly_window.used_percent)
+    numeric_used_values = [used for used in used_values if used is not None]
+    if not numeric_used_values:
         return base_interval
+    used = max(numeric_used_values)
     if used >= critical_threshold_percent:
         return min(base_interval, critical_interval)
     if used >= near_threshold_percent:

@@ -23,6 +23,12 @@ def status_text(state: Dict[str, Any]) -> str:
     reason = state.get("reason")
 
     if status == "open" and used is not None:
+        primary = state.get("primary") if isinstance(state.get("primary"), dict) else {}
+        weekly = state.get("weekly") if isinstance(state.get("weekly"), dict) else {}
+        primary_used = primary.get("usedPercent", used)
+        weekly_used = weekly.get("usedPercent")
+        if weekly_used is not None:
+            return f"Quota Sentry: 5h {primary_used}% used | weekly {weekly_used}% used"
         return f"Quota Sentry: {used}% used"
 
     pieces = [f"Quota Sentry: {status}"]
@@ -55,6 +61,10 @@ def status_health_warnings(
 
 def resolve_state_dir(value: Optional[str]) -> Path:
     return Path(value).expanduser().resolve() if value else core.cache_dir()
+
+
+def resolve_config_path(value: Optional[str]) -> Path:
+    return Path(value).expanduser().resolve() if value else core.default_config_path()
 
 
 def script_path() -> Path:
@@ -93,6 +103,16 @@ def write_pid(pid_path: Path, pid: int) -> None:
     pid_path.write_text(f"{pid}\n")
 
 
+def percent_value(value: str) -> int:
+    try:
+        percent = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 100") from exc
+    if percent < 1 or percent > 100:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 100")
+    return percent
+
+
 def poll_command(args: argparse.Namespace) -> int:
     state_dir = resolve_state_dir(args.state_dir)
     decision = core.poll_once(
@@ -100,6 +120,7 @@ def poll_command(args: argparse.Namespace) -> int:
         threshold_percent=args.threshold_percent,
         reset_buffer_seconds=args.reset_buffer_seconds,
         source=args.source,
+        config_path=resolve_config_path(args.config_path),
     )
     print(status_text(core.state_from_decision(decision)))
     return 0
@@ -126,6 +147,7 @@ def daemon_command(args: argparse.Namespace) -> int:
             threshold_percent=args.threshold_percent,
             reset_buffer_seconds=args.reset_buffer_seconds,
             source=args.source,
+            config_path=resolve_config_path(args.config_path),
         )
         print(status_text(core.state_from_decision(decision)), flush=True)
         sleep_seconds = core.next_poll_interval_seconds(
@@ -181,6 +203,8 @@ def start_command(args: argparse.Namespace) -> int:
         "--critical-interval-seconds",
         str(args.critical_interval_seconds),
     ]
+    if args.config_path:
+        command.extend(["--config-path", str(resolve_config_path(args.config_path))])
     with log_path.open("ab") as log_file:
         process = subprocess.Popen(
             command,
@@ -236,6 +260,7 @@ def guard_command(args: argparse.Namespace) -> int:
             threshold_percent=args.threshold_percent,
             reset_buffer_seconds=args.reset_buffer_seconds,
             source=args.source,
+            config_path=resolve_config_path(args.config_path),
         )
 
     return core.wait_if_blocked(
@@ -277,10 +302,33 @@ def install_hook_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def configure_command(args: argparse.Namespace) -> int:
+    config_path = resolve_config_path(args.config_path)
+    current = core.read_config(config_path)
+    weekly_mode = args.weekly_mode or current.weekly_mode
+    weekly_threshold_percent = (
+        args.weekly_threshold_percent
+        if args.weekly_threshold_percent is not None
+        else current.weekly_threshold_percent
+    )
+    config = core.QuotaConfig(
+        weekly_mode=weekly_mode,
+        weekly_threshold_percent=weekly_threshold_percent,
+    )
+    core.write_config(config_path, config)
+    print(
+        "Quota Sentry: weekly "
+        f"{config.weekly_mode} at {config.weekly_threshold_percent}%"
+    )
+    print(f"Quota Sentry: config {config_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="quota-sentry")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--state-dir", default=None)
+    common.add_argument("--config-path", default=None)
     common.add_argument("--threshold-percent", type=int, default=core.DEFAULT_THRESHOLD_PERCENT)
     common.add_argument("--reset-buffer-seconds", type=int, default=core.DEFAULT_RESET_BUFFER_SECONDS)
     common.add_argument(
@@ -353,6 +401,15 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--hooks-path", default=str(Path.home() / ".codex" / "hooks.json"))
     install_parser.add_argument("--script-path", default=None)
     install_parser.set_defaults(func=install_hook_command)
+
+    configure_parser = subparsers.add_parser("configure", parents=[common])
+    configure_parser.add_argument(
+        "--weekly-mode",
+        choices=[core.WEEKLY_MODE_ADVISORY, core.WEEKLY_MODE_HARD_BLOCK],
+        default=None,
+    )
+    configure_parser.add_argument("--weekly-threshold-percent", type=percent_value, default=None)
+    configure_parser.set_defaults(func=configure_command)
 
     return parser
 

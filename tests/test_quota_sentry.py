@@ -151,6 +151,70 @@ class ParseCodexbarUsageTest(unittest.TestCase):
         self.assertEqual(decision.used_percent, 97)
         self.assertEqual(decision.window_minutes, 300)
 
+    def test_weekly_window_is_advisory_by_default(self):
+        payload = codexbar_payload(used_percent=50)
+        payload[0]["usage"]["secondary"]["usedPercent"] = 99
+
+        decision = core.parse_codexbar_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+        state = core.state_from_decision(decision, now=NOW)
+
+        self.assertEqual(decision.status, "open")
+        self.assertEqual(decision.used_percent, 50)
+        self.assertEqual(decision.weekly_window.used_percent, 99)
+        self.assertEqual(state["weekly"]["usedPercent"], 99)
+        self.assertEqual(state["weekly"]["windowMinutes"], 10080)
+
+    def test_weekly_window_hard_blocks_when_explicitly_enabled(self):
+        payload = codexbar_payload(used_percent=50)
+        payload[0]["usage"]["secondary"]["usedPercent"] = 99
+
+        decision = core.parse_codexbar_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+            quota_config=core.QuotaConfig(
+                weekly_mode=core.WEEKLY_MODE_HARD_BLOCK,
+                weekly_threshold_percent=99,
+            ),
+        )
+
+        self.assertEqual(decision.status, "blocked")
+        self.assertEqual(decision.used_percent, 99)
+        self.assertEqual(decision.window_minutes, 10080)
+        self.assertEqual(decision.blocked_window, "weekly")
+        self.assertEqual(
+            decision.blocked_until,
+            datetime(2026, 6, 7, 21, 46, 36, tzinfo=timezone.utc),
+        )
+
+    def test_weekly_hard_block_waits_for_later_reset_when_both_windows_block(self):
+        payload = codexbar_payload(
+            used_percent=95,
+            resets_at="2026-06-01T17:00:00Z",
+        )
+        payload[0]["usage"]["secondary"]["usedPercent"] = 99
+
+        decision = core.parse_codexbar_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+            quota_config=core.QuotaConfig(
+                weekly_mode=core.WEEKLY_MODE_HARD_BLOCK,
+                weekly_threshold_percent=99,
+            ),
+        )
+
+        self.assertEqual(decision.status, "blocked")
+        self.assertEqual(decision.blocked_window, "weekly")
+        self.assertEqual(decision.window_minutes, 10080)
+
 
 class StateTest(unittest.TestCase):
     def test_state_round_trips_decision_as_json(self):
@@ -169,6 +233,8 @@ class StateTest(unittest.TestCase):
         self.assertEqual(loaded["status"], "blocked")
         self.assertEqual(loaded["usedPercent"], 95)
         self.assertEqual(loaded["blockedUntil"], "2026-06-01T21:24:05Z")
+        self.assertEqual(loaded["primary"]["usedPercent"], 95)
+        self.assertEqual(loaded["weekly"]["usedPercent"], 39)
 
     def test_should_block_from_state_requires_fresh_blocked_state(self):
         state = {
@@ -494,6 +560,55 @@ class PollIntervalTest(unittest.TestCase):
         self.assertEqual(near, 60)
         self.assertEqual(critical, 30)
 
+    def test_weekly_advisory_usage_does_not_tighten_poll_interval(self):
+        decision = core.QuotaDecision(
+            status="open",
+            reason="open",
+            used_percent=10,
+            weekly_window=core.QuotaWindow(
+                name="weekly",
+                used_percent=99,
+                window_minutes=10080,
+                resets_at=datetime(2026, 6, 7, 21, 45, 36, tzinfo=timezone.utc),
+            ),
+        )
+
+        interval = core.next_poll_interval_seconds(
+            decision,
+            base_interval_seconds=300,
+            near_threshold_percent=85,
+            near_interval_seconds=60,
+            critical_threshold_percent=93,
+            critical_interval_seconds=30,
+        )
+
+        self.assertEqual(interval, 300)
+
+    def test_weekly_hard_block_usage_tightens_poll_interval(self):
+        decision = core.QuotaDecision(
+            status="open",
+            reason="open",
+            used_percent=10,
+            weekly_window=core.QuotaWindow(
+                name="weekly",
+                used_percent=99,
+                window_minutes=10080,
+                resets_at=datetime(2026, 6, 7, 21, 45, 36, tzinfo=timezone.utc),
+            ),
+            weekly_hard_block_enabled=True,
+        )
+
+        interval = core.next_poll_interval_seconds(
+            decision,
+            base_interval_seconds=300,
+            near_threshold_percent=85,
+            near_interval_seconds=60,
+            critical_threshold_percent=93,
+            critical_interval_seconds=30,
+        )
+
+        self.assertEqual(interval, 30)
+
 
 class CodexbarFetchTest(unittest.TestCase):
     def test_app_server_rate_limits_response_maps_to_codex_usage_payload(self):
@@ -563,6 +678,53 @@ class CodexbarFetchTest(unittest.TestCase):
         self.assertTrue(calls[0][1]["close_fds"])
 
 
+class ConfigTest(unittest.TestCase):
+    def test_default_config_is_weekly_advisory(self):
+        config = core.read_config(Path("/path/that/does/not/exist/config.json"))
+
+        self.assertEqual(config.weekly_mode, core.WEEKLY_MODE_ADVISORY)
+        self.assertEqual(config.weekly_threshold_percent, 99)
+
+    def test_config_round_trips_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config = core.QuotaConfig(
+                weekly_mode=core.WEEKLY_MODE_HARD_BLOCK,
+                weekly_threshold_percent=98,
+            )
+
+            core.write_config(config_path, config)
+            loaded = core.read_config(config_path)
+
+        self.assertEqual(loaded, config)
+
+    def test_configure_command_persists_weekly_hard_block_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            args = cli.build_parser().parse_args(
+                [
+                    "configure",
+                    "--config-path",
+                    str(config_path),
+                    "--weekly-mode",
+                    "hard-block",
+                    "--weekly-threshold-percent",
+                    "99",
+                ]
+            )
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                result = cli.configure_command(args)
+
+            loaded = core.read_config(config_path)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(loaded.weekly_mode, core.WEEKLY_MODE_HARD_BLOCK)
+        self.assertEqual(loaded.weekly_threshold_percent, 99)
+        self.assertIn("weekly hard-block at 99%", stdout.getvalue())
+
+
 class DaemonStartTest(unittest.TestCase):
     def test_start_defaults_to_five_minute_daemon_interval(self):
         args = cli.build_parser().parse_args(["start"])
@@ -584,7 +746,16 @@ class DaemonStartTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             args = cli.build_parser().parse_args(
-                ["start", "--quiet", "--state-dir", temp_dir, "--source", "codex-app-server"]
+                [
+                    "start",
+                    "--quiet",
+                    "--state-dir",
+                    temp_dir,
+                    "--source",
+                    "codex-app-server",
+                    "--config-path",
+                    str(Path(temp_dir) / "config.json"),
+                ]
             )
             with mock.patch.object(cli.subprocess, "Popen", side_effect=fake_popen):
                 result = cli.start_command(args)
@@ -593,6 +764,7 @@ class DaemonStartTest(unittest.TestCase):
         self.assertIsInstance(popen_command["value"], list)
         self.assertIn("--source", popen_command["value"])
         self.assertIn("codex-app-server", popen_command["value"])
+        self.assertIn("--config-path", popen_command["value"])
         self.assertIs(popen_kwargs["stdin"], subprocess.DEVNULL)
         self.assertTrue(popen_kwargs["start_new_session"])
         self.assertTrue(popen_kwargs["close_fds"])
@@ -672,6 +844,18 @@ class CliStatusTest(unittest.TestCase):
 
         self.assertEqual(text, "Quota Sentry: 14% used")
 
+    def test_status_text_for_open_state_includes_weekly_when_available(self):
+        text = cli.status_text(
+            {
+                "status": "open",
+                "usedPercent": 14,
+                "primary": {"usedPercent": 14, "windowMinutes": 300},
+                "weekly": {"usedPercent": 96, "windowMinutes": 10080},
+            }
+        )
+
+        self.assertEqual(text, "Quota Sentry: 5h 14% used | weekly 96% used")
+
     def test_status_command_hides_daemon_pid_unless_verbose(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = core.default_state_path(Path(temp_dir))
@@ -723,6 +907,7 @@ class AutonomousHarnessTest(unittest.TestCase):
         self.assertIn("AT-001 live Codex quota source smoke", result.stdout)
         self.assertIn("AT-007 global hook config", result.stdout)
         self.assertIn("AT-011 auto source falls back to CodexBar", result.stdout)
+        self.assertIn("AT-012 weekly hard-block opt-in", result.stdout)
 
 
 if __name__ == "__main__":

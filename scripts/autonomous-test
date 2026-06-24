@@ -29,6 +29,7 @@ SCENARIOS = [
     ("AT-009", "state-only guard avoids live source"),
     ("AT-010", "prompt guard avoids live source"),
     ("AT-011", "auto source falls back to CodexBar"),
+    ("AT-012", "weekly hard-block opt-in"),
 ]
 
 
@@ -85,9 +86,13 @@ if mode == "app-server-exit-failure":
 
 used = 17
 reset_delta = 300
+weekly_used = 33
+weekly_reset_delta = 604800
 if mode == "app-server-blocked-short":
     used = 99
     reset_delta = 2
+elif mode == "app-server-weekly-high":
+    weekly_used = 99
 
 for line in sys.stdin:
     try:
@@ -116,9 +121,9 @@ for line in sys.stdin:
                                 "resetsAt": now + reset_delta,
                             },
                             "secondary": {
-                                "usedPercent": 33,
+                                "usedPercent": weekly_used,
                                 "windowDurationMins": 10080,
-                                "resetsAt": now + 604800,
+                                "resetsAt": now + weekly_reset_delta,
                             },
                         },
                     },
@@ -188,6 +193,7 @@ print(json.dumps(payload))
     def env(self, fake_mode: Optional[str] = None) -> Dict[str, str]:
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["XDG_CONFIG_HOME"] = str(self.run_dir / "config-home")
         if fake_mode:
             env["QUOTA_SENTRY_FAKE_MODE"] = fake_mode
         return env
@@ -273,7 +279,10 @@ print(json.dumps(payload))
         state = self.state(state_dir)
         if state.get("status") != "open" or state.get("usedPercent") != 17:
             raise AutonomousTestError(f"expected app-server open 17% state, got: {state}")
-        result.notes.append("Default auto source used the Codex app-server adapter.")
+        weekly = state.get("weekly") if isinstance(state.get("weekly"), dict) else {}
+        if weekly.get("usedPercent") != 33 or weekly.get("windowMinutes") != 10080:
+            raise AutonomousTestError(f"expected weekly advisory state, got: {state}")
+        result.notes.append("Default auto source used the Codex app-server adapter and recorded weekly usage.")
 
     def scenario_synthetic_open_poll(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "synthetic-open"
@@ -611,6 +620,41 @@ print(json.dumps(payload))
             raise AutonomousTestError(f"expected CodexBar fallback open 12% state, got: {state}")
         result.notes.append("Auto source failed over from Codex app-server to CodexBar.")
 
+    def scenario_weekly_hard_block_opt_in(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "weekly-hard-block"
+        config_path = state_dir / "config.json"
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "configure",
+                "--config-path",
+                str(config_path),
+                "--weekly-mode",
+                "hard-block",
+                "--weekly-threshold-percent",
+                "99",
+            ],
+        )
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "poll",
+                "--state-dir",
+                str(state_dir),
+                "--config-path",
+                str(config_path),
+            ],
+            env=self.env("app-server-weekly-high"),
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "blocked" or state.get("blockedWindow") != "weekly":
+            raise AutonomousTestError(f"expected weekly hard-block state, got: {state}")
+        if state.get("windowMinutes") != 10080 or state.get("usedPercent") != 99:
+            raise AutonomousTestError(f"weekly hard-block used the wrong window: {state}")
+        result.notes.append("Explicit config enabled weekly hard-blocking at 99%.")
+
     def run_all(self) -> None:
         self.run_scenario("AT-001", "live Codex quota source smoke", self.scenario_live_quota_source_smoke)
         self.run_scenario("AT-002", "synthetic Codex app-server poll", self.scenario_synthetic_codex_app_server_poll)
@@ -623,6 +667,7 @@ print(json.dumps(payload))
         self.run_scenario("AT-009", "state-only guard avoids live source", self.scenario_state_only_guard_avoids_live_source)
         self.run_scenario("AT-010", "prompt guard avoids live source", self.scenario_prompt_guard_avoids_live_source)
         self.run_scenario("AT-011", "auto source falls back to CodexBar", self.scenario_auto_source_falls_back_to_codexbar)
+        self.run_scenario("AT-012", "weekly hard-block opt-in", self.scenario_weekly_hard_block_opt_in)
 
     def write_report(self) -> Path:
         report_path = self.run_dir / "report.md"

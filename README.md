@@ -4,7 +4,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/dhruvil009/QuotaSentry?style=social)](https://github.com/dhruvil009/QuotaSentry/stargazers)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 
-Quota Sentry is a local circuit breaker for Codex quota. It watches your 5-hour usage window and pauses new Codex activity before you burn through the limit.
+Quota Sentry is a local circuit breaker for Codex quota. It watches your 5-hour usage window, records weekly usage, and pauses new Codex activity before you burn through an enforced limit.
 
 It is for the moment when a long agent session keeps going, your quota window is nearly spent, and the next prompt or tool call should wait instead of wasting the last few percent.
 
@@ -82,7 +82,9 @@ The `v0.1.x` line supports Codex only:
 - Uses `codex app-server --stdio` by default, reading `account/rateLimits/read`.
 - Falls back to CodexBar when `--source auto` cannot use the app-server path.
 - Monitors the 5-hour window (`windowMinutes: 300`) by default.
+- Records the weekly window (`windowMinutes: 10080`) as advisory status by default.
 - Blocks at `usedPercent >= 95` until `resetsAt` plus a 60-second buffer.
+- Weekly hard-blocking is opt-in and defaults to `99%` when enabled.
 - Fails open when quota source data is missing, malformed, unavailable, or state is stale.
 
 The background daemon polls every five minutes by default, tightens its cadence near the quota threshold, and writes state for synchronous hooks to read.
@@ -97,12 +99,14 @@ Run from the repository root:
 ./scripts/quota-sentry status
 ./scripts/quota-sentry guard
 ./scripts/quota-sentry stop
+./scripts/quota-sentry configure --weekly-mode hard-block --weekly-threshold-percent 99
 ```
 
 `status` is intentionally terse for normal use:
 
 ```text
 Quota Sentry: 14% used
+Quota Sentry: 5h 14% used | weekly 96% used
 ```
 
 It warns when the saved quota state is stale and the background daemon is not running. Use `status --verbose` to include daemon details.
@@ -118,6 +122,24 @@ Quota Sentry: waiting for Codex quota reset until <timestamp>.
 Use `./scripts/quota-sentry guard --verbose` only when running it manually and you want a captured wait message too. Use `--no-notify` to suppress the terminal notice. Use `--state-only` for hook paths that must only read cached daemon state and must not invoke a live quota source. Installed Codex hooks suppress terminal notices.
 
 Live polling accepts `--source auto`, `--source codex-app-server`, or `--source codexbar`. The default `auto` mode tries Codex app-server first and falls back to CodexBar if needed.
+
+## Weekly Policy
+
+Weekly usage is advisory by default. Quota Sentry records the weekly window in `state.json` and shows it in `status`, but it will not block on weekly usage unless the user explicitly opts in.
+
+Enable weekly hard-blocking:
+
+```bash
+./scripts/quota-sentry configure --weekly-mode hard-block --weekly-threshold-percent 99
+```
+
+Return to advisory mode:
+
+```bash
+./scripts/quota-sentry configure --weekly-mode advisory
+```
+
+When weekly hard-blocking is enabled and weekly usage reaches the configured threshold, Quota Sentry blocks until the weekly `resetsAt` plus the normal reset buffer. If both the 5-hour and weekly windows are blocked, it waits until the later relevant reset. Missing or malformed weekly data fails open for weekly enforcement.
 
 Daemon cadence is configurable:
 
@@ -160,6 +182,12 @@ Files:
 - `state.json`: latest quota decision.
 - `quota-sentry.pid`: daemon pid.
 - `quota-sentry.log`: daemon output.
+
+Config lives at:
+
+```text
+~/.config/quota-sentry/config.json
+```
 
 ## Development
 

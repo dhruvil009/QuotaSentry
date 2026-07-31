@@ -11,9 +11,11 @@ Quota Sentry is a local Codex quota guard.
 
 - Uses `codex app-server --stdio` by default, reading `account/rateLimits/read`.
 - Falls back to CodexBar when `--source auto` cannot use the app-server path.
-- Watches the 5-hour Codex window (`windowMinutes: 300`).
-- Records weekly usage (`windowMinutes: 10080`) as advisory status by default.
-- Starts blocking when `usedPercent >= 95`.
+- Reads both the canonical bucket and `rateLimitsByLimitId` when available.
+- Classifies quota policy by duration, not the `primary` or `secondary` source slot.
+- Guards canonical short-term windows up to 24 hours and starts blocking at `usedPercent >= 95`.
+- Records the seven-day window (`windowMinutes: 10080`) as advisory status by default.
+- Records unfamiliar long-term and auxiliary buckets without globally blocking them.
 - Weekly hard-blocking is opt-in through config and defaults to `99%` when enabled.
 - Waits until `resetsAt` plus a 60-second buffer.
 - Fails open if usage data is unavailable.
@@ -46,6 +48,8 @@ Use `./scripts/autonomous-test` for the E2E harness. It performs one live Codex 
 `poll`, `start`, and `guard` accept `--source auto|codex-app-server|codexbar`. Default `auto` uses Codex app-server first and falls back to CodexBar.
 
 Weekly usage is advisory by default. Use `configure --weekly-mode hard-block --weekly-threshold-percent 99` to opt in to weekly blocking, or `configure --weekly-mode advisory` to return to status-only weekly behavior. Config lives at `~/.config/quota-sentry/config.json`; installed hook commands should remain unchanged.
+
+Do not infer policy from source position. A weekly-only response may legitimately place the seven-day window in `primary`; it must remain weekly advisory unless hard-blocking is enabled.
 
 `guard` keeps stdout/stderr quiet by default to avoid flooding Codex hook context after long waits. It still writes one wait notice directly to the controlling terminal when waiting starts unless `--no-notify` is set. Use `guard --verbose` only for manual debugging, `guard --no-notify` to suppress the terminal notice, and `guard --state-only` when a hook must not perform a live quota-source poll.
 

@@ -4,7 +4,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/dhruvil009/QuotaSentry?style=social)](https://github.com/dhruvil009/QuotaSentry/stargazers)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 
-Quota Sentry is a local circuit breaker for Codex quota. It watches your 5-hour usage window, records weekly usage, and pauses new Codex activity before you burn through an enforced limit.
+Quota Sentry is a local circuit breaker for Codex quota. It discovers the quota windows Codex currently exposes, guards short-term usage, records weekly usage, and pauses new Codex activity before you burn through an enforced limit.
 
 It is for the moment when a long agent session keeps going, your quota window is nearly spent, and the next prompt or tool call should wait instead of wasting the last few percent.
 
@@ -16,7 +16,7 @@ Quota Sentry: waiting for Codex quota reset until 2026-06-01T21:24:05Z.
 ## Why Use It
 
 - Avoid accidentally exhausting a paid or rate-limited Codex window.
-- Keep long-running Codex sessions from starting new work when the 5-hour quota is already near the threshold.
+- Keep long-running Codex sessions from starting new work when a short-term quota is already near the threshold.
 - Fail open when quota data is unavailable, malformed, stale, or unsafe to trust.
 - Keep hooks quiet so Codex does not flood the TUI with guard output after a long wait.
 
@@ -81,11 +81,15 @@ The `v0.1.x` line supports Codex only:
 
 - Uses `codex app-server --stdio` by default, reading `account/rateLimits/read`.
 - Falls back to CodexBar when `--source auto` cannot use the app-server path.
-- Monitors the 5-hour window (`windowMinutes: 300`) by default.
-- Records the weekly window (`windowMinutes: 10080`) as advisory status by default.
-- Blocks at `usedPercent >= 95` until `resetsAt` plus a 60-second buffer.
+- Reads the canonical `rateLimits` bucket and preserves the newer `rateLimitsByLimitId` multi-bucket view when Codex provides it.
+- Classifies canonical windows by duration, never by whether Codex placed them in `primary` or `secondary`.
+- Treats windows up to 24 hours as short-term and blocks at `usedPercent >= 95` until `resetsAt` plus a 60-second buffer.
+- Treats the seven-day window (`windowMinutes: 10080`) as weekly advisory status by default.
 - Weekly hard-blocking is opt-in and defaults to `99%` when enabled.
-- Fails open when quota source data is missing, malformed, unavailable, or state is stale.
+- Records unfamiliar long-term, durationless, and auxiliary limit-ID windows without globally blocking on them.
+- Fails open when quota source data is missing, malformed, unavailable, unfamiliar, or state is stale.
+
+Codex may add, remove, or reorder quota windows. `primary` and `secondary` are retained only as source-slot metadata. For example, if Codex temporarily exposes only a weekly window in `primary`, Quota Sentry reports weekly usage and does not reinterpret it as a short-term limit.
 
 The background daemon polls every five minutes by default, tightens its cadence near the quota threshold, and writes state for synchronous hooks to read.
 
@@ -107,6 +111,7 @@ Run from the repository root:
 ```text
 Quota Sentry: 14% used
 Quota Sentry: 5h 14% used | weekly 96% used
+Quota Sentry: weekly 5% used
 ```
 
 It warns when the saved quota state is stale and the background daemon is not running. Use `status --verbose` to include daemon details.
@@ -125,7 +130,7 @@ Live polling accepts `--source auto`, `--source codex-app-server`, or `--source 
 
 ## Weekly Policy
 
-Weekly usage is advisory by default. Quota Sentry records the weekly window in `state.json` and shows it in `status`, but it will not block on weekly usage unless the user explicitly opts in.
+Weekly usage is advisory by default. Quota Sentry records the weekly window in `state.json` and shows it in `status`, but it will not block on weekly usage unless the user explicitly opts in. This remains true when weekly is the only window Codex returns or when it occupies the `primary` source slot.
 
 Enable weekly hard-blocking:
 
@@ -139,7 +144,7 @@ Return to advisory mode:
 ./scripts/quota-sentry configure --weekly-mode advisory
 ```
 
-When weekly hard-blocking is enabled and weekly usage reaches the configured threshold, Quota Sentry blocks until the weekly `resetsAt` plus the normal reset buffer. If both the 5-hour and weekly windows are blocked, it waits until the later relevant reset. Missing or malformed weekly data fails open for weekly enforcement.
+When weekly hard-blocking is enabled and weekly usage reaches the configured threshold, Quota Sentry blocks until the weekly `resetsAt` plus the normal reset buffer. If both a short-term and weekly window are blocked, it waits until the later relevant reset. Missing or malformed weekly data fails open for weekly enforcement.
 
 Daemon cadence is configurable:
 
@@ -179,7 +184,7 @@ Default state lives under:
 
 Files:
 
-- `state.json`: latest quota decision.
+- `state.json`: latest quota decision plus normalized `windows`, `shortTerm`, and `weekly` views. `primary` remains a compatibility alias for `shortTerm`.
 - `quota-sentry.pid`: daemon pid.
 - `quota-sentry.log`: daemon output.
 
@@ -203,7 +208,7 @@ Run autonomous E2E tests:
 ./scripts/autonomous-test
 ```
 
-The autonomous harness runs one live Codex quota-source smoke poll, then uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. It writes a report under `.quota-sentry-runs/`.
+The autonomous harness runs one live Codex quota-source smoke poll, then uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios, including reordered slots, weekly-only responses, and auxiliary limit buckets. It writes a report under `.quota-sentry-runs/`.
 
 For clean clones without installed Codex hooks, the global hook scenario is skipped by default. Use `./scripts/autonomous-test --skip-live --require-global-hook` when you specifically need to verify that this checkout is installed in `~/.codex/hooks.json`.
 

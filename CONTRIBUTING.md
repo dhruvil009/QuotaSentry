@@ -30,6 +30,7 @@ When adding support for a harness such as Claude Code or OpenCode:
 
 - Document the harness version, quota source, hook or wrapper entrypoint, and install/uninstall steps.
 - Use structured quota data when available; avoid scraping terminal text unless there is no stable alternative.
+- Preserve stable bucket IDs, window duration, reset time, and source-slot metadata separately. Never infer quota policy from positional names such as `primary` or `secondary`.
 - Make missing credentials, missing binaries, unknown quota windows, and parse errors fail open.
 - Keep stdout/stderr quiet in hook execution paths.
 - Emit at most one human-readable wait notice through the terminal path when blocking begins.
@@ -102,6 +103,7 @@ Before opening or merging a change:
 - Run `./scripts/autonomous-test --skip-live` for logic-only changes.
 - Run full `./scripts/autonomous-test` for changes that touch quota-source adapters, hooks, daemon lifecycle, or user-visible wait behavior.
 - For new harnesses, include synthetic E2E tests for below-threshold, blocked, reset, stale-state, missing-binary, and malformed-quota cases.
+- For quota adapters, include reordered-slot, missing-window, unknown-duration, and multiple-bucket cases.
 - Keep generated `.quota-sentry-runs/` artifacts out of commits.
 - Do not commit local paths, personal tokens, credentials, cookies, or provider account data.
 - Update `README.md`, autonomous testing docs, or plugin skill/command docs when behavior changes.

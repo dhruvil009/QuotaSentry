@@ -72,6 +72,8 @@ If the user asks to return weekly behavior to advisory status, run:
 
 Weekly usage is advisory by default. Hard-blocking is opt-in through `configure`, stored in `~/.config/quota-sentry/config.json`, and does not require changing installed hook commands.
 
+Quota policy follows window duration and canonical limit identity, not Codex's `primary` or `secondary` slot names. Short-term windows up to 24 hours use the normal guard; seven-day windows use weekly policy; unfamiliar long-term and auxiliary buckets are recorded but fail open.
+
 `guard` should keep stdout/stderr quiet in hooks. It writes one wait notice directly to the controlling terminal when waiting starts. Use `./scripts/quota-sentry guard --verbose` only for manual debugging.
 
 Current hook model:

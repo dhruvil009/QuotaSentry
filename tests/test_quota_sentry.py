@@ -151,6 +151,95 @@ class ParseCodexbarUsageTest(unittest.TestCase):
         self.assertEqual(decision.used_percent, 97)
         self.assertEqual(decision.window_minutes, 300)
 
+    def test_weekly_only_primary_slot_remains_advisory(self):
+        payload = codexbar_payload(used_percent=99)
+        payload[0]["usage"]["primary"]["windowMinutes"] = 10080
+        payload[0]["usage"]["primary"]["resetsAt"] = "2026-06-07T21:45:36Z"
+        del payload[0]["usage"]["secondary"]
+
+        decision = core.parse_codex_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+        state = core.state_from_decision(decision, now=NOW)
+
+        self.assertEqual(decision.status, "open")
+        self.assertFalse(decision.fail_open)
+        self.assertIsNone(decision.short_term_window)
+        self.assertEqual(decision.weekly_window.used_percent, 99)
+        self.assertIsNone(state["shortTerm"])
+        self.assertIsNone(state["primary"])
+        self.assertEqual(state["weekly"]["sourceSlot"], "primary")
+        self.assertEqual(state["windows"][0]["kind"], "weekly")
+
+    def test_weekly_only_primary_slot_hard_blocks_when_opted_in(self):
+        payload = codexbar_payload(used_percent=99)
+        payload[0]["usage"]["primary"]["windowMinutes"] = 10080
+        payload[0]["usage"]["primary"]["resetsAt"] = "2026-06-07T21:45:36Z"
+        del payload[0]["usage"]["secondary"]
+
+        decision = core.parse_codex_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+            quota_config=core.QuotaConfig(
+                weekly_mode=core.WEEKLY_MODE_HARD_BLOCK,
+                weekly_threshold_percent=99,
+            ),
+        )
+
+        self.assertEqual(decision.status, "blocked")
+        self.assertEqual(decision.blocked_window, core.WINDOW_KIND_WEEKLY)
+        self.assertEqual(decision.window_minutes, 10080)
+
+    def test_non_five_hour_short_term_window_uses_short_term_policy(self):
+        payload = codexbar_payload(used_percent=95)
+        payload[0]["usage"]["primary"]["windowMinutes"] = 15
+        del payload[0]["usage"]["secondary"]
+
+        decision = core.parse_codex_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.status, "blocked")
+        self.assertEqual(decision.blocked_window, core.WINDOW_KIND_SHORT_TERM)
+        self.assertEqual(decision.window_minutes, 15)
+
+    def test_unfamiliar_long_term_window_is_recorded_and_fails_open(self):
+        payload = codexbar_payload(used_percent=100)
+        payload[0]["usage"]["primary"]["windowMinutes"] = 2880
+        del payload[0]["usage"]["secondary"]
+
+        decision = core.parse_codex_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.status, "open")
+        self.assertTrue(decision.fail_open)
+        self.assertEqual(decision.quota_windows[0].kind, core.WINDOW_KIND_LONG_TERM)
+        self.assertIn("unfamiliar", decision.reason)
+
+    def test_fractional_usage_is_preserved(self):
+        payload = codexbar_payload(used_percent=94.75)
+
+        decision = core.parse_codex_usage(
+            payload,
+            threshold_percent=95,
+            reset_buffer_seconds=60,
+            now=NOW,
+        )
+
+        self.assertEqual(decision.used_percent, 94.75)
+
     def test_weekly_window_is_advisory_by_default(self):
         payload = codexbar_payload(used_percent=50)
         payload[0]["usage"]["secondary"]["usedPercent"] = 99
@@ -609,6 +698,33 @@ class PollIntervalTest(unittest.TestCase):
 
         self.assertEqual(interval, 30)
 
+    def test_weekly_only_advisory_state_does_not_tighten_poll_interval(self):
+        weekly = core.QuotaWindow(
+            name="weekly",
+            used_percent=99,
+            window_minutes=10080,
+            resets_at=datetime(2026, 6, 7, 21, 45, 36, tzinfo=timezone.utc),
+            kind=core.WINDOW_KIND_WEEKLY,
+        )
+        decision = core.QuotaDecision(
+            status="open",
+            reason="weekly advisory",
+            used_percent=99,
+            weekly_window=weekly,
+            quota_windows=(weekly,),
+        )
+
+        interval = core.next_poll_interval_seconds(
+            decision,
+            base_interval_seconds=300,
+            near_threshold_percent=85,
+            near_interval_seconds=60,
+            critical_threshold_percent=93,
+            critical_interval_seconds=30,
+        )
+
+        self.assertEqual(interval, 300)
+
 
 class CodexbarFetchTest(unittest.TestCase):
     def test_app_server_rate_limits_response_maps_to_codex_usage_payload(self):
@@ -624,6 +740,101 @@ class CodexbarFetchTest(unittest.TestCase):
         self.assertEqual(payload[0]["usage"]["primary"]["resetsAt"], "2026-06-01T21:23:05Z")
         self.assertEqual(payload[0]["usage"]["secondary"]["usedPercent"], 97)
         self.assertEqual(payload[0]["usage"]["secondary"]["windowMinutes"], 10080)
+        self.assertEqual(payload[0]["usage"]["windows"][0]["sourceSlot"], "primary")
+        self.assertTrue(payload[0]["usage"]["windows"][0]["isDefaultLimit"])
+
+    def test_app_server_multi_bucket_payload_preserves_auxiliary_limits_without_enforcing_them(self):
+        response = app_server_rate_limits_response(
+            primary_used_percent=50,
+            secondary_used_percent=50,
+        )
+        response["rateLimits"]["limitId"] = "codex"
+        response["rateLimitsByLimitId"] = {
+            "codex": response["rateLimits"],
+            "codex_other": {
+                "limitId": "codex_other",
+                "limitName": "Codex Other",
+                "primary": {
+                    "usedPercent": 100,
+                    "windowDurationMins": 15,
+                    "resetsAt": int(
+                        datetime(2026, 6, 1, 17, 0, 0, tzinfo=timezone.utc).timestamp()
+                    ),
+                },
+            },
+        }
+
+        payload = core.codex_app_server_rate_limits_to_usage(response, now=NOW)
+        decision = core.parse_codex_usage(payload, threshold_percent=95, now=NOW)
+        windows = payload[0]["usage"]["windows"]
+
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(windows[-1]["limitId"], "codex_other")
+        self.assertFalse(windows[-1]["isDefaultLimit"])
+        self.assertEqual(decision.status, "open")
+        self.assertEqual(len(decision.quota_windows), 3)
+        self.assertEqual(decision.quota_windows[-1].limit_id, "codex_other")
+
+    def test_app_server_can_select_canonical_codex_bucket_without_legacy_view(self):
+        response = {
+            "rateLimits": None,
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 21,
+                        "windowDurationMins": 10080,
+                        "resetsAt": int(
+                            datetime(2026, 6, 7, 21, 45, 36, tzinfo=timezone.utc).timestamp()
+                        ),
+                    },
+                }
+            },
+        }
+
+        payload = core.codex_app_server_rate_limits_to_usage(response, now=NOW)
+
+        self.assertEqual(payload[0]["usage"]["activeLimitId"], "codex")
+        self.assertEqual(payload[0]["usage"]["primary"]["usedPercent"], 21)
+        self.assertTrue(payload[0]["usage"]["windows"][0]["isDefaultLimit"])
+
+    def test_app_server_infers_default_limit_id_from_matching_multi_bucket_view(self):
+        response = app_server_rate_limits_response()
+        response["rateLimitsByLimitId"] = {"codex": response["rateLimits"]}
+
+        payload = core.codex_app_server_rate_limits_to_usage(response, now=NOW)
+
+        self.assertEqual(payload[0]["usage"]["activeLimitId"], "codex")
+        self.assertEqual(
+            {window["limitId"] for window in payload[0]["usage"]["windows"]},
+            {"codex"},
+        )
+
+    def test_app_server_does_not_promote_an_arbitrary_auxiliary_bucket(self):
+        response = {
+            "rateLimits": None,
+            "rateLimitsByLimitId": {
+                "codex_other": {
+                    "limitId": "codex_other",
+                    "primary": {
+                        "usedPercent": 100,
+                        "windowDurationMins": 15,
+                        "resetsAt": int(
+                            datetime(2026, 6, 1, 17, 0, 0, tzinfo=timezone.utc).timestamp()
+                        ),
+                    },
+                }
+            },
+        }
+
+        payload = core.codex_app_server_rate_limits_to_usage(response, now=NOW)
+        decision = core.parse_codex_usage(payload, threshold_percent=95, now=NOW)
+
+        self.assertIsNone(payload[0]["usage"]["activeLimitId"])
+        self.assertNotIn("primary", payload[0]["usage"])
+        self.assertFalse(payload[0]["usage"]["windows"][0]["isDefaultLimit"])
+        self.assertEqual(decision.status, "open")
+        self.assertTrue(decision.fail_open)
 
     def test_fetch_codex_usage_auto_prefers_app_server(self):
         app_payload = codexbar_payload(used_percent=12)
@@ -856,6 +1067,42 @@ class CliStatusTest(unittest.TestCase):
 
         self.assertEqual(text, "Quota Sentry: 5h 14% used | weekly 96% used")
 
+    def test_status_text_for_weekly_only_state_is_explicit(self):
+        text = cli.status_text(
+            {
+                "status": "open",
+                "usedPercent": 5,
+                "windows": [
+                    {
+                        "kind": "weekly",
+                        "usedPercent": 5,
+                        "windowMinutes": 10080,
+                        "isDefaultLimit": True,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(text, "Quota Sentry: weekly 5% used")
+
+    def test_status_text_preserves_fractional_usage_without_padding(self):
+        text = cli.status_text(
+            {
+                "status": "open",
+                "usedPercent": 14.25,
+                "windows": [
+                    {
+                        "kind": "short-term",
+                        "usedPercent": 14.25,
+                        "windowMinutes": 300,
+                        "isDefaultLimit": True,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(text, "Quota Sentry: 14.25% used")
+
     def test_status_command_hides_daemon_pid_unless_verbose(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = core.default_state_path(Path(temp_dir))
@@ -908,6 +1155,8 @@ class AutonomousHarnessTest(unittest.TestCase):
         self.assertIn("AT-007 global hook config", result.stdout)
         self.assertIn("AT-011 auto source falls back to CodexBar", result.stdout)
         self.assertIn("AT-012 weekly hard-block opt-in", result.stdout)
+        self.assertIn("AT-013 weekly-only positional safety", result.stdout)
+        self.assertIn("AT-014 auxiliary bucket remains advisory", result.stdout)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ SCENARIOS = [
     ("AT-010", "prompt guard avoids live source"),
     ("AT-011", "auto source falls back to CodexBar"),
     ("AT-012", "weekly hard-block opt-in"),
+    ("AT-013", "weekly-only positional safety"),
+    ("AT-014", "auxiliary bucket remains advisory"),
 ]
 
 
@@ -88,11 +90,18 @@ used = 17
 reset_delta = 300
 weekly_used = 33
 weekly_reset_delta = 604800
+weekly_only = False
+auxiliary_high = False
 if mode == "app-server-blocked-short":
     used = 99
     reset_delta = 2
 elif mode == "app-server-weekly-high":
     weekly_used = 99
+elif mode == "app-server-weekly-only":
+    weekly_used = 99
+    weekly_only = True
+elif mode == "app-server-auxiliary-high":
+    auxiliary_high = True
 
 for line in sys.stdin:
     try:
@@ -108,24 +117,48 @@ for line in sys.stdin:
         continue
     elif method == "account/rateLimits/read":
         now = int(time.time())
+        if weekly_only:
+            rate_limits = {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": weekly_used,
+                    "windowDurationMins": 10080,
+                    "resetsAt": now + weekly_reset_delta,
+                },
+            }
+        else:
+            rate_limits = {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": used,
+                    "windowDurationMins": 300,
+                    "resetsAt": now + reset_delta,
+                },
+                "secondary": {
+                    "usedPercent": weekly_used,
+                    "windowDurationMins": 10080,
+                    "resetsAt": now + weekly_reset_delta,
+                },
+            }
+        rate_limits_by_id = {"codex": rate_limits}
+        if auxiliary_high:
+            rate_limits_by_id["codex_other"] = {
+                "limitId": "codex_other",
+                "limitName": "Codex Other",
+                "primary": {
+                    "usedPercent": 100,
+                    "windowDurationMins": 15,
+                    "resetsAt": now + reset_delta,
+                },
+            }
         print(
             json.dumps(
                 {
                     "id": request_id,
                     "result": {
                         "planType": "plus",
-                        "rateLimits": {
-                            "primary": {
-                                "usedPercent": used,
-                                "windowDurationMins": 300,
-                                "resetsAt": now + reset_delta,
-                            },
-                            "secondary": {
-                                "usedPercent": weekly_used,
-                                "windowDurationMins": 10080,
-                                "resetsAt": now + weekly_reset_delta,
-                            },
-                        },
+                        "rateLimits": rate_limits,
+                        "rateLimitsByLimitId": rate_limits_by_id,
                     },
                 }
             ),
@@ -267,6 +300,22 @@ print(json.dumps(payload))
         state = self.state(state_dir)
         if state.get("status") not in {"open", "blocked"}:
             raise AutonomousTestError(f"live quota source smoke returned unexpected state: {state}")
+        windows = state.get("windows") if isinstance(state.get("windows"), list) else []
+        canonical_windows = [
+            window
+            for window in windows
+            if isinstance(window, dict) and window.get("isDefaultLimit") is not False
+        ]
+        has_short_term = any(
+            window.get("kind") == "short-term" for window in canonical_windows
+        )
+        has_weekly = any(window.get("kind") == "weekly" for window in canonical_windows)
+        if has_weekly and not has_short_term:
+            if state.get("shortTerm") is not None or state.get("primary") is not None:
+                raise AutonomousTestError(
+                    f"live weekly-only response was misclassified as short-term: {state}"
+                )
+            result.notes.append("Live weekly-only response retained no short-term compatibility alias.")
         result.notes.append(f"Live state: {state.get('status')} at {state.get('usedPercent')}% used.")
 
     def scenario_synthetic_codex_app_server_poll(self, result: ScenarioResult) -> None:
@@ -655,6 +704,43 @@ print(json.dumps(payload))
             raise AutonomousTestError(f"weekly hard-block used the wrong window: {state}")
         result.notes.append("Explicit config enabled weekly hard-blocking at 99%.")
 
+    def scenario_weekly_only_positional_safety(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "weekly-only"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-weekly-only"),
+        )
+        state = self.state(state_dir)
+        weekly = state.get("weekly") if isinstance(state.get("weekly"), dict) else {}
+        if state.get("status") != "open" or state.get("blockedWindow") is not None:
+            raise AutonomousTestError(f"weekly-only advisory state blocked unexpectedly: {state}")
+        if state.get("shortTerm") is not None or state.get("primary") is not None:
+            raise AutonomousTestError(f"weekly primary slot was misclassified as short-term: {state}")
+        if weekly.get("usedPercent") != 99 or weekly.get("sourceSlot") != "primary":
+            raise AutonomousTestError(f"weekly-only window metadata was not preserved: {state}")
+        result.notes.append("A 99% weekly window in Codex's primary slot stayed advisory.")
+
+    def scenario_auxiliary_bucket_remains_advisory(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "auxiliary-bucket"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-auxiliary-high"),
+        )
+        state = self.state(state_dir)
+        windows = state.get("windows") if isinstance(state.get("windows"), list) else []
+        auxiliary = [
+            window
+            for window in windows
+            if isinstance(window, dict) and window.get("limitId") == "codex_other"
+        ]
+        if state.get("status") != "open":
+            raise AutonomousTestError(f"auxiliary quota bucket blocked the whole harness: {state}")
+        if len(auxiliary) != 1 or auxiliary[0].get("isDefaultLimit") is not False:
+            raise AutonomousTestError(f"auxiliary quota metadata was not retained: {state}")
+        result.notes.append("A saturated auxiliary bucket was recorded without globally blocking Codex.")
+
     def run_all(self) -> None:
         self.run_scenario("AT-001", "live Codex quota source smoke", self.scenario_live_quota_source_smoke)
         self.run_scenario("AT-002", "synthetic Codex app-server poll", self.scenario_synthetic_codex_app_server_poll)
@@ -668,6 +754,8 @@ print(json.dumps(payload))
         self.run_scenario("AT-010", "prompt guard avoids live source", self.scenario_prompt_guard_avoids_live_source)
         self.run_scenario("AT-011", "auto source falls back to CodexBar", self.scenario_auto_source_falls_back_to_codexbar)
         self.run_scenario("AT-012", "weekly hard-block opt-in", self.scenario_weekly_hard_block_opt_in)
+        self.run_scenario("AT-013", "weekly-only positional safety", self.scenario_weekly_only_positional_safety)
+        self.run_scenario("AT-014", "auxiliary bucket remains advisory", self.scenario_auxiliary_bucket_remains_advisory)
 
     def write_report(self) -> Path:
         report_path = self.run_dir / "report.md"

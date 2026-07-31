@@ -12,6 +12,65 @@ from typing import Any, Dict, Optional
 from quota_sentry import core
 
 
+def format_percent(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def duration_label(window_minutes: Any, kind: Optional[str] = None) -> str:
+    if kind == core.WINDOW_KIND_WEEKLY or window_minutes == core.DEFAULT_WEEKLY_WINDOW_MINUTES:
+        return "weekly"
+    try:
+        minutes = int(window_minutes)
+    except (TypeError, ValueError):
+        return "quota"
+    if minutes > 0 and minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes > 0 and minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
+def status_windows(state: Dict[str, Any]) -> list[Dict[str, Any]]:
+    windows = state.get("windows")
+    if isinstance(windows, list):
+        normalized = [
+            window
+            for window in windows
+            if isinstance(window, dict)
+            and window.get("usedPercent") is not None
+            and window.get("isDefaultLimit") is not False
+        ]
+        if normalized:
+            return normalized
+
+    legacy: list[Dict[str, Any]] = []
+    short_term = state.get("shortTerm")
+    primary = state.get("primary")
+    weekly = state.get("weekly")
+    for window in (short_term, primary, weekly):
+        if not isinstance(window, dict) or window.get("usedPercent") is None:
+            continue
+        identity = (
+            window.get("windowMinutes"),
+            window.get("resetsAt"),
+            window.get("usedPercent"),
+        )
+        if any(
+            (
+                existing.get("windowMinutes"),
+                existing.get("resetsAt"),
+                existing.get("usedPercent"),
+            )
+            == identity
+            for existing in legacy
+        ):
+            continue
+        legacy.append(window)
+    return legacy
+
+
 def status_text(state: Dict[str, Any]) -> str:
     if not state:
         return "Quota Sentry: no state found"
@@ -22,18 +81,40 @@ def status_text(state: Dict[str, Any]) -> str:
     updated_at = state.get("updatedAt")
     reason = state.get("reason")
 
-    if status == "open" and used is not None:
-        primary = state.get("primary") if isinstance(state.get("primary"), dict) else {}
-        weekly = state.get("weekly") if isinstance(state.get("weekly"), dict) else {}
-        primary_used = primary.get("usedPercent", used)
-        weekly_used = weekly.get("usedPercent")
-        if weekly_used is not None:
-            return f"Quota Sentry: 5h {primary_used}% used | weekly {weekly_used}% used"
-        return f"Quota Sentry: {used}% used"
+    if status == "open":
+        windows = status_windows(state)
+        if len(windows) == 1:
+            window = windows[0]
+            window_used = format_percent(window.get("usedPercent"))
+            kind = window.get("kind")
+            window_minutes = window.get("windowMinutes")
+            if kind == core.WINDOW_KIND_SHORT_TERM or (
+                isinstance(window_minutes, int)
+                and 0 < window_minutes <= core.DEFAULT_SHORT_TERM_WINDOW_MAX_MINUTES
+            ):
+                return f"Quota Sentry: {window_used}% used"
+            label = duration_label(window_minutes, kind)
+            return f"Quota Sentry: {label} {window_used}% used"
+        if windows:
+            pieces = [
+                (
+                    f"{duration_label(window.get('windowMinutes'), window.get('kind'))} "
+                    f"{format_percent(window.get('usedPercent'))}% used"
+                )
+                for window in sorted(
+                    windows,
+                    key=lambda candidate: candidate.get("windowMinutes")
+                    if isinstance(candidate.get("windowMinutes"), int)
+                    else 10**12,
+                )
+            ]
+            return "Quota Sentry: " + " | ".join(pieces)
+        if used is not None:
+            return f"Quota Sentry: {format_percent(used)}% used"
 
     pieces = [f"Quota Sentry: {status}"]
     if used is not None:
-        pieces.append(f"{used}% used")
+        pieces.append(f"{format_percent(used)}% used")
     if blocked_until:
         pieces.append(f"blocked until {blocked_until}")
     if updated_at:

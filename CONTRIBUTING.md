@@ -7,7 +7,7 @@ Thanks for improving Quota Sentry. The first supported harness is Codex, but the
 Quota Sentry should stay small, local, and conservative:
 
 - Avoid wasting paid or rate-limited quota.
-- Fail open when quota data is missing, malformed, stale, or unavailable.
+- Fail closed at lifecycle checkpoints when authoritative quota data is missing, malformed, stale, or unavailable.
 - Keep hooks and wrappers quiet unless the user explicitly asks for debug output.
 - Preserve a clear manual bypass for every harness integration.
 - Keep harness-specific behavior isolated so new adapters do not regress Codex.
@@ -24,14 +24,14 @@ No package install is required for the core test suite; the project currently us
 
 ## Adding Harness Support
 
-Codex support uses `codex app-server --stdio` as the primary source and keeps CodexBar as an optional fallback adapter. New harness integrations should be added as isolated adapters, scripts, commands, or plugin surfaces rather than by hardcoding another harness into the Codex path.
+Codex support uses `codex app-server --stdio` as its authoritative default source and keeps CodexBar only as an explicitly selected compatibility adapter. New harness integrations should be added as isolated adapters, scripts, commands, or plugin surfaces rather than by hardcoding another harness into the Codex path.
 
 When adding support for a harness such as Claude Code or OpenCode:
 
 - Document the harness version, quota source, hook or wrapper entrypoint, and install/uninstall steps.
 - Use structured quota data when available; avoid scraping terminal text unless there is no stable alternative.
 - Preserve stable bucket IDs, window duration, reset time, and source-slot metadata separately. Never infer quota policy from positional names such as `primary` or `secondary`.
-- Make missing credentials, missing binaries, unknown quota windows, and parse errors fail open.
+- Record missing credentials, missing binaries, unknown quota windows, and parse errors as an unavailable state; installed enforcement checkpoints must fail closed until authoritative data returns.
 - Keep stdout/stderr quiet in hook execution paths.
 - Emit at most one human-readable wait notice through the terminal path when blocking begins.
 - Add a bypass equivalent to `QUOTA_SENTRY_DISABLE=1`.

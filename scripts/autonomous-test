@@ -2,9 +2,10 @@
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
-import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,6 +16,8 @@ from typing import Dict, List, Optional
 ROOT = Path(__file__).resolve().parents[1]
 QUOTA_SENTRY = ROOT / "scripts" / "quota-sentry"
 DEFAULT_RUN_ROOT = ROOT / ".quota-sentry-runs"
+EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS = 366 * 24 * 60 * 60
+EXPECTED_HOOK_WATCHDOG_SECONDS = EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS - 10 * 60
 
 
 SCENARIOS = [
@@ -28,10 +31,18 @@ SCENARIOS = [
     ("AT-008", "CodexBar failure fails open"),
     ("AT-009", "state-only guard avoids live source"),
     ("AT-010", "prompt guard avoids live source"),
-    ("AT-011", "auto source falls back to CodexBar"),
-    ("AT-012", "weekly hard-block opt-in"),
-    ("AT-013", "weekly-only positional safety"),
+    ("AT-011", "auto source never downgrades authority"),
+    ("AT-012", "weekly advisory opt-out"),
+    ("AT-013", "weekly-only default hard-block"),
     ("AT-014", "auxiliary bucket remains advisory"),
+    ("AT-015", "weekly prompt guard waits for authoritative reset"),
+    ("AT-016", "hook safety deadline fails closed"),
+    ("AT-017", "confirmed block survives source failure"),
+    ("AT-018", "valid block wins over malformed sibling"),
+    ("AT-019", "backend exhaustion without windows blocks"),
+    ("AT-020", "fresh unknown state fails closed"),
+    ("AT-021", "omitted backend state cannot clear latch"),
+    ("AT-022", "ambiguous replacement buckets fail closed"),
 ]
 
 
@@ -82,7 +93,7 @@ if sys.argv[1:] != ["app-server", "--stdio"]:
     sys.exit(64)
 
 mode = os.environ.get("QUOTA_SENTRY_FAKE_MODE", "app-server-open")
-if mode == "app-server-exit-failure":
+if mode in {"app-server-exit-failure", "all-sources-exit-failure"}:
     print("simulated codex app-server failure", file=sys.stderr)
     sys.exit(3)
 
@@ -92,6 +103,10 @@ weekly_used = 33
 weekly_reset_delta = 604800
 weekly_only = False
 auxiliary_high = False
+malformed_short = False
+account_exhausted_without_windows = False
+explicit_backend_clear = False
+ambiguous_replacement_buckets = False
 if mode == "app-server-blocked-short":
     used = 99
     reset_delta = 2
@@ -100,8 +115,26 @@ elif mode == "app-server-weekly-high":
 elif mode == "app-server-weekly-only":
     weekly_used = 99
     weekly_only = True
+elif mode == "app-server-weekly-only-short-reset":
+    weekly_used = 99
+    weekly_reset_delta = 6
+    weekly_only = True
+elif mode == "app-server-weekly-transition":
+    transition_at = float(os.environ["QUOTA_SENTRY_FAKE_TRANSITION_AT"])
+    weekly_used = 99 if time.time() < transition_at else 0
+    weekly_reset_delta = max(1, int(transition_at - time.time())) if weekly_used == 99 else 604800
+    weekly_only = True
+elif mode == "app-server-weekly-high-malformed-short":
+    weekly_used = 99
+    malformed_short = True
 elif mode == "app-server-auxiliary-high":
     auxiliary_high = True
+elif mode == "app-server-account-exhausted-no-windows":
+    account_exhausted_without_windows = True
+elif mode == "app-server-explicit-backend-clear":
+    explicit_backend_clear = True
+elif mode == "app-server-ambiguous-replacement-buckets":
+    ambiguous_replacement_buckets = True
 
 for line in sys.stdin:
     try:
@@ -117,7 +150,12 @@ for line in sys.stdin:
         continue
     elif method == "account/rateLimits/read":
         now = int(time.time())
-        if weekly_only:
+        if account_exhausted_without_windows:
+            rate_limits = {
+                "limitId": "codex",
+                "rateLimitReachedType": "rate_limit_reached",
+            }
+        elif weekly_only:
             rate_limits = {
                 "limitId": "codex",
                 "primary": {
@@ -132,7 +170,7 @@ for line in sys.stdin:
                 "primary": {
                     "usedPercent": used,
                     "windowDurationMins": 300,
-                    "resetsAt": now + reset_delta,
+                    "resetsAt": "invalid" if malformed_short else now + reset_delta,
                 },
                 "secondary": {
                     "usedPercent": weekly_used,
@@ -140,7 +178,31 @@ for line in sys.stdin:
                     "resetsAt": now + weekly_reset_delta,
                 },
             }
-        rate_limits_by_id = {"codex": rate_limits}
+        if ambiguous_replacement_buckets:
+            rate_limits = {}
+            rate_limits_by_id = {
+                "codex_next": {
+                    "limitId": "codex_next",
+                    "primary": {
+                        "usedPercent": 10,
+                        "windowDurationMins": 300,
+                        "resetsAt": now + reset_delta,
+                    },
+                },
+                "codex_other": {
+                    "limitId": "codex_other",
+                    "primary": {
+                        "usedPercent": 100,
+                        "windowDurationMins": 10080,
+                        "resetsAt": now + weekly_reset_delta,
+                    },
+                },
+            }
+        else:
+            rate_limits_by_id = {"codex": rate_limits}
+        if explicit_backend_clear:
+            rate_limits["rateLimitReachedType"] = None
+            rate_limits["spendControlReached"] = False
         if auxiliary_high:
             rate_limits_by_id["codex_other"] = {
                 "limitId": "codex_other",
@@ -179,11 +241,15 @@ from datetime import datetime, timedelta, timezone
 
 mode = os.environ.get("QUOTA_SENTRY_FAKE_MODE", "open")
 now = datetime.now(timezone.utc)
+marker = os.environ.get("QUOTA_SENTRY_FAKE_CODEXBAR_MARKER")
+if marker:
+    with open(marker, "a", encoding="utf-8") as handle:
+        handle.write("invoked\\n")
 
 def ts(delta_seconds):
     return (now + timedelta(seconds=delta_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-if mode == "exit-failure":
+if mode in {"exit-failure", "all-sources-exit-failure"}:
     print("simulated codexbar failure", file=sys.stderr)
     sys.exit(2)
 
@@ -281,6 +347,103 @@ print(json.dumps(payload))
             time.sleep(0.2)
         raise AutonomousTestError(f"state file was not created within {timeout_seconds}s: {state_dir}")
 
+    def codex_hooks_list(self, result: ScenarioResult) -> Dict[str, object]:
+        args = ["codex", "app-server", "--stdio"]
+        started = time.monotonic()
+        process = subprocess.Popen(
+            args,
+            cwd=ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+            close_fds=True,
+        )
+        output_queue = queue.Queue()
+        stdout_lines = []
+
+        def read_output() -> None:
+            try:
+                if process.stdout is not None:
+                    for line in process.stdout:
+                        output_queue.put(line)
+            finally:
+                output_queue.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        response = None
+        try:
+            if process.stdin is None:
+                raise AutonomousTestError("Codex app-server stdin was unavailable")
+            requests = [
+                {
+                    "id": "quota-sentry-e2e-init",
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {
+                            "name": "quota-sentry-e2e",
+                            "title": "Quota Sentry E2E",
+                            "version": "0",
+                        },
+                        "capabilities": {"experimentalApi": True},
+                    },
+                },
+                {"method": "initialized"},
+                {
+                    "id": "quota-sentry-e2e-hooks",
+                    "method": "hooks/list",
+                    "params": {"cwds": [str(ROOT)]},
+                },
+            ]
+            for request in requests:
+                process.stdin.write(json.dumps(request) + "\n")
+                process.stdin.flush()
+
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                try:
+                    line = output_queue.get(timeout=max(0.01, deadline - time.monotonic()))
+                except queue.Empty:
+                    break
+                if line is None:
+                    break
+                stdout_lines.append(line)
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("id") == "quota-sentry-e2e-hooks":
+                    response = payload
+                    break
+            if response is None:
+                raise AutonomousTestError("Codex hooks/list did not return within 15 seconds")
+            if "error" in response:
+                raise AutonomousTestError(f"Codex hooks/list failed: {response['error']}")
+            payload = response.get("result")
+            if not isinstance(payload, dict):
+                raise AutonomousTestError("Codex hooks/list returned no result object")
+            return payload
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            result.commands.append(
+                CommandRecord(
+                    args=args,
+                    returncode=process.returncode,
+                    stdout="".join(stdout_lines),
+                    stderr="",
+                    duration_seconds=time.monotonic() - started,
+                )
+            )
+
     def run_scenario(self, scenario_id: str, title: str, scenario) -> None:
         result = ScenarioResult(scenario_id=scenario_id, title=title)
         try:
@@ -296,21 +459,74 @@ print(json.dumps(payload))
             result.notes.append("Skipped by --skip-live.")
             return
         state_dir = self.run_dir / "live-smoke"
-        self.run(result, [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)], timeout=60)
+        config_path = state_dir / "absent-default-config.json"
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "poll",
+                "--state-dir",
+                str(state_dir),
+                "--config-path",
+                str(config_path),
+            ],
+            timeout=60,
+        )
         state = self.state(state_dir)
         if state.get("status") not in {"open", "blocked"}:
             raise AutonomousTestError(f"live quota source smoke returned unexpected state: {state}")
+        if config_path.exists():
+            raise AutonomousTestError("live default-policy smoke unexpectedly created a config file")
+        if state.get("weeklyHardBlockEnabled") is not True:
+            raise AutonomousTestError(f"live default policy did not enable weekly hard-blocking: {state}")
+
         windows = state.get("windows") if isinstance(state.get("windows"), list) else []
         canonical_windows = [
             window
             for window in windows
             if isinstance(window, dict) and window.get("isDefaultLimit") is not False
         ]
+        weekly_windows = [
+            window for window in canonical_windows if window.get("windowMinutes") == 10080
+        ]
+        if weekly_windows:
+            weekly = state.get("weekly") if isinstance(state.get("weekly"), dict) else None
+            if weekly is None or weekly.get("windowMinutes") != 10080:
+                raise AutonomousTestError(
+                    f"live seven-day window was not exposed as weekly state: {state}"
+                )
+            if any(window.get("kind") != "weekly" for window in weekly_windows):
+                raise AutonomousTestError(
+                    f"live seven-day window was classified with the wrong policy kind: {state}"
+                )
+
+        weekly_is_exhausted = False
+        for weekly_window in weekly_windows:
+            used_percent = weekly_window.get("usedPercent")
+            resets_at_raw = weekly_window.get("resetsAt")
+            try:
+                resets_at = datetime.fromisoformat(str(resets_at_raw).replace("Z", "+00:00"))
+            except ValueError:
+                resets_at = None
+            weekly_is_exhausted = weekly_is_exhausted or (
+                isinstance(used_percent, (int, float))
+                and used_percent >= 99
+                and resets_at is not None
+                and resets_at > datetime.now(timezone.utc)
+            )
+        if weekly_is_exhausted and (
+            state.get("status") != "blocked" or state.get("blockedWindow") != "weekly"
+        ):
+            raise AutonomousTestError(
+                f"live weekly usage reached the hard-block threshold without blocking: {state}"
+            )
+
         has_short_term = any(
-            window.get("kind") == "short-term" for window in canonical_windows
+            isinstance(window.get("windowMinutes"), int)
+            and window.get("windowMinutes") <= 1440
+            for window in canonical_windows
         )
-        has_weekly = any(window.get("kind") == "weekly" for window in canonical_windows)
-        if has_weekly and not has_short_term:
+        if weekly_windows and not has_short_term:
             if state.get("shortTerm") is not None or state.get("primary") is not None:
                 raise AutonomousTestError(
                     f"live weekly-only response was misclassified as short-term: {state}"
@@ -330,7 +546,7 @@ print(json.dumps(payload))
             raise AutonomousTestError(f"expected app-server open 17% state, got: {state}")
         weekly = state.get("weekly") if isinstance(state.get("weekly"), dict) else {}
         if weekly.get("usedPercent") != 33 or weekly.get("windowMinutes") != 10080:
-            raise AutonomousTestError(f"expected weekly advisory state, got: {state}")
+            raise AutonomousTestError(f"expected weekly usage state, got: {state}")
         result.notes.append("Default auto source used the Codex app-server adapter and recorded weekly usage.")
 
     def scenario_synthetic_open_poll(self, result: ScenarioResult) -> None:
@@ -506,12 +722,14 @@ print(json.dumps(payload))
         serialized = json.dumps(merged)
         if "echo existing" not in serialized:
             raise AutonomousTestError("existing hook was not preserved")
-        for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
+        for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
             if event_name not in merged.get("hooks", {}):
                 raise AutonomousTestError(f"missing hook event after merge: {event_name}")
             event_hook = merged["hooks"][event_name][-1]["hooks"][0]
             if event_hook.get("async") is not False:
                 raise AutonomousTestError(f"{event_name} hook must be synchronous for Codex 0.140 compatibility")
+        if merged["hooks"]["SessionStart"][-1].get("matcher") != "startup|resume|clear|compact":
+            raise AutonomousTestError("SessionStart hook does not cover resumed sessions")
         user_prompt_command = merged["hooks"]["UserPromptSubmit"][-1]["hooks"][0]["command"]
         pre_tool_command = merged["hooks"]["PreToolUse"][-1]["hooks"][0]["command"]
         if "prompt-guard" not in user_prompt_command:
@@ -525,12 +743,34 @@ print(json.dumps(payload))
             raise AutonomousTestError(f"UserPromptSubmit hook invokes quota-sentry more than once: {user_prompt_command}")
         if "guard --state-only --no-notify" not in pre_tool_command:
             raise AutonomousTestError(f"PreToolUse hook is not cache-only: {pre_tool_command}")
+        for event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
+            event_hook = merged["hooks"][event_name][-1]["hooks"][0]
+            if event_hook.get("timeout") != EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS:
+                raise AutonomousTestError(
+                    f"{event_name} hook has unsafe timeout: {event_hook.get('timeout')!r}"
+                )
+            if (
+                f"--fail-closed-after-seconds {EXPECTED_HOOK_WATCHDOG_SECONDS}"
+                not in event_hook.get("command", "")
+            ):
+                raise AutonomousTestError(f"{event_name} hook is missing its fail-closed watchdog")
+            if "--read-hook-input" not in event_hook.get("command", ""):
+                raise AutonomousTestError(f"{event_name} hook does not consume Codex hook stdin")
+            if "--require-fresh-state" not in event_hook.get("command", ""):
+                raise AutonomousTestError(f"{event_name} hook does not fail closed on stale state")
+        post_tool_command = merged["hooks"]["PostToolUse"][-1]["hooks"][0].get("command", "")
+        if "--fail-closed-format block-json" not in post_tool_command:
+            raise AutonomousTestError("PostToolUse hook does not block its result on watchdog")
+        pre_compact_command = merged["hooks"]["PreCompact"][-1]["hooks"][0].get("command", "")
+        if "--fail-closed-format stop-json" not in pre_compact_command:
+            raise AutonomousTestError("PreCompact hook does not stop compaction on watchdog")
         if not hooks_path.with_suffix(".json.bak").exists():
             raise AutonomousTestError("expected hook backup was not written")
         result.notes.append("Temp hook install preserved existing hooks and wrote a backup.")
 
     def scenario_global_hook_config(self, result: ScenarioResult) -> None:
-        hooks_path = Path.home() / ".codex" / "hooks.json"
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+        hooks_path = codex_home / "hooks.json"
         if not hooks_path.exists():
             if not self.require_global_hook:
                 result.status = "SKIP"
@@ -546,7 +786,7 @@ print(json.dumps(payload))
                 result.notes.append(f"Global hooks do not reference this checkout: {expected}")
                 return
             raise AutonomousTestError(f"global hooks do not reference {expected}")
-        for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
+        for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
             if event_name not in payload.get("hooks", {}):
                 raise AutonomousTestError(f"global hooks missing {event_name}")
             event_hook = payload["hooks"][event_name][-1]["hooks"][0]
@@ -565,7 +805,86 @@ print(json.dumps(payload))
             raise AutonomousTestError("global UserPromptSubmit hook invokes quota-sentry more than once")
         if "guard --state-only --no-notify" not in pre_tool_serialized:
             raise AutonomousTestError("global PreToolUse hook is not cache-only")
-        result.notes.append("Installed global hooks reference this checkout.")
+        for event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
+            event_hook = payload["hooks"][event_name][-1]["hooks"][0]
+            if event_hook.get("timeout") != EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS:
+                raise AutonomousTestError(
+                    f"global {event_name} hook has unsafe timeout: {event_hook.get('timeout')!r}"
+                )
+            if (
+                f"--fail-closed-after-seconds {EXPECTED_HOOK_WATCHDOG_SECONDS}"
+                not in event_hook.get("command", "")
+            ):
+                raise AutonomousTestError(
+                    f"global {event_name} hook is missing its fail-closed watchdog"
+                )
+            if "--read-hook-input" not in event_hook.get("command", ""):
+                raise AutonomousTestError(f"global {event_name} hook does not consume hook stdin")
+            if "--require-fresh-state" not in event_hook.get("command", ""):
+                raise AutonomousTestError(f"global {event_name} hook does not fail closed on stale state")
+        post_tool_command = payload["hooks"]["PostToolUse"][-1]["hooks"][0].get("command", "")
+        if "--fail-closed-format block-json" not in post_tool_command:
+            raise AutonomousTestError("global PostToolUse hook does not block its result on watchdog")
+        pre_compact_command = payload["hooks"]["PreCompact"][-1]["hooks"][0].get("command", "")
+        if "--fail-closed-format stop-json" not in pre_compact_command:
+            raise AutonomousTestError("global PreCompact hook does not stop compaction on watchdog")
+
+        catalog = self.codex_hooks_list(result)
+        catalog_entries = catalog.get("data")
+        if not isinstance(catalog_entries, list):
+            raise AutonomousTestError("Codex hooks/list returned no cwd entries")
+        cwd_entry = next(
+            (
+                entry
+                for entry in catalog_entries
+                if isinstance(entry, dict) and entry.get("cwd") == str(ROOT)
+            ),
+            None,
+        )
+        if not isinstance(cwd_entry, dict):
+            raise AutonomousTestError("Codex hooks/list omitted the repository cwd")
+        if cwd_entry.get("errors"):
+            raise AutonomousTestError(f"Codex hooks/list reported errors: {cwd_entry['errors']}")
+        metadata = cwd_entry.get("hooks")
+        if not isinstance(metadata, list):
+            raise AutonomousTestError("Codex hooks/list returned no hook metadata")
+
+        wire_events = {
+            "SessionStart": "sessionStart",
+            "UserPromptSubmit": "userPromptSubmit",
+            "PreToolUse": "preToolUse",
+            "PostToolUse": "postToolUse",
+            "PreCompact": "preCompact",
+        }
+        for config_event, wire_event in wire_events.items():
+            expected_hook = payload["hooks"][config_event][-1]["hooks"][0]
+            matches = [
+                hook
+                for hook in metadata
+                if isinstance(hook, dict)
+                and hook.get("eventName") == wire_event
+                and hook.get("command") == expected_hook.get("command")
+                and Path(str(hook.get("sourcePath"))).expanduser().resolve()
+                == hooks_path.resolve()
+            ]
+            if len(matches) != 1:
+                raise AutonomousTestError(
+                    f"Codex hooks/list did not discover exactly one {config_event} hook"
+                )
+            discovered = matches[0]
+            if discovered.get("enabled") is not True:
+                raise AutonomousTestError(f"Codex {config_event} hook is disabled")
+            if discovered.get("trustStatus") not in {"trusted", "managed"}:
+                raise AutonomousTestError(
+                    f"Codex {config_event} hook is not trusted: {discovered.get('trustStatus')!r}"
+                )
+            if discovered.get("timeoutSec") != expected_hook.get("timeout"):
+                raise AutonomousTestError(
+                    f"Codex {config_event} timeout differs from hooks.json"
+                )
+        result.notes.append(
+            "Codex hooks/list verified five exact, enabled, trusted hooks from this checkout."
+        )
 
     def scenario_codexbar_failure_fails_open(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "codexbar-failure"
@@ -603,6 +922,8 @@ print(json.dumps(payload))
             [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir), "--source", "codexbar"],
             env=self.env("open"),
         )
+        state_path = state_dir / "state.json"
+        cached_state = state_path.read_bytes()
         guard_result = self.run(
             result,
             [
@@ -622,6 +943,8 @@ print(json.dumps(payload))
             raise AutonomousTestError(
                 f"state-only guard emitted hook output: stdout={guard_result.stdout!r} stderr={guard_result.stderr!r}"
             )
+        if state_path.read_bytes() != cached_state:
+            raise AutonomousTestError("state-only guard modified cached state through a live poll")
         state = self.state(state_dir)
         if state.get("status") != "open":
             raise AutonomousTestError(f"state-only guard should preserve cached open state, got: {state}")
@@ -631,46 +954,69 @@ print(json.dumps(payload))
         state_dir = self.run_dir / "prompt-guard"
         self.run(
             result,
-            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir), "--source", "codexbar"],
-            env=self.env("open"),
-        )
-        (state_dir / "quota-sentry.pid").write_text(f"{os.getpid()}\n")
-        guard_result = self.run(
-            result,
             [
                 str(QUOTA_SENTRY),
-                "prompt-guard",
+                "start",
                 "--state-dir",
                 str(state_dir),
-                "--max-state-age-seconds",
-                "30",
+                "--interval-seconds",
+                "60",
             ],
-            env=self.env("exit-failure"),
-            timeout=5,
+            env=self.env("open"),
         )
-        if guard_result.stdout.strip() or guard_result.stderr.strip():
-            raise AutonomousTestError(
-                f"prompt-guard emitted hook output: stdout={guard_result.stdout!r} stderr={guard_result.stderr!r}"
+        try:
+            self.wait_for_state(state_dir)
+            state_path = state_dir / "state.json"
+            cached_state = state_path.read_bytes()
+            guard_result = self.run(
+                result,
+                [
+                    str(QUOTA_SENTRY),
+                    "prompt-guard",
+                    "--state-dir",
+                    str(state_dir),
+                    "--max-state-age-seconds",
+                    "30",
+                ],
+                env=self.env("all-sources-exit-failure"),
+                timeout=5,
             )
-        state = self.state(state_dir)
-        if state.get("status") != "open":
-            raise AutonomousTestError(f"prompt-guard should preserve cached open state, got: {state}")
+            if guard_result.stdout.strip() or guard_result.stderr.strip():
+                raise AutonomousTestError(
+                    f"prompt-guard emitted hook output: stdout={guard_result.stdout!r} stderr={guard_result.stderr!r}"
+                )
+            if state_path.read_bytes() != cached_state:
+                raise AutonomousTestError("prompt-guard modified cached state through a live poll")
+            state = self.state(state_dir)
+            if state.get("status") != "open":
+                raise AutonomousTestError(f"prompt-guard should preserve cached open state, got: {state}")
+        finally:
+            self.run(
+                result,
+                [str(QUOTA_SENTRY), "stop", "--state-dir", str(state_dir)],
+                env=self.env("open"),
+            )
         result.notes.append("Prompt guard used cached state and did not call a failing live source from the hook path.")
 
-    def scenario_auto_source_falls_back_to_codexbar(self, result: ScenarioResult) -> None:
-        state_dir = self.run_dir / "auto-fallback"
+    def scenario_auto_source_never_downgrades_authority(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "auto-authority"
+        codexbar_marker = state_dir / "codexbar-invoked"
+        env = self.env("app-server-exit-failure")
+        env["QUOTA_SENTRY_FAKE_CODEXBAR_MARKER"] = str(codexbar_marker)
         self.run(
             result,
             [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
-            env=self.env("app-server-exit-failure"),
+            env=env,
         )
         state = self.state(state_dir)
-        if state.get("status") != "open" or state.get("usedPercent") != 12:
-            raise AutonomousTestError(f"expected CodexBar fallback open 12% state, got: {state}")
-        result.notes.append("Auto source failed over from Codex app-server to CodexBar.")
+        if state.get("status") != "unknown" or "app-server" not in str(state.get("reason")):
+            raise AutonomousTestError(f"expected authoritative source failure state, got: {state}")
+        if codexbar_marker.exists():
+            raise AutonomousTestError("auto source invoked lower-authority CodexBar")
+        result.notes.append("Auto source preserved app-server authority and did not invoke CodexBar.")
 
-    def scenario_weekly_hard_block_opt_in(self, result: ScenarioResult) -> None:
-        state_dir = self.run_dir / "weekly-hard-block"
+    def scenario_weekly_advisory_opt_out(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "weekly-advisory"
         config_path = state_dir / "config.json"
         self.run(
             result,
@@ -680,7 +1026,7 @@ print(json.dumps(payload))
                 "--config-path",
                 str(config_path),
                 "--weekly-mode",
-                "hard-block",
+                "advisory",
                 "--weekly-threshold-percent",
                 "99",
             ],
@@ -698,11 +1044,11 @@ print(json.dumps(payload))
             env=self.env("app-server-weekly-high"),
         )
         state = self.state(state_dir)
-        if state.get("status") != "blocked" or state.get("blockedWindow") != "weekly":
-            raise AutonomousTestError(f"expected weekly hard-block state, got: {state}")
-        if state.get("windowMinutes") != 10080 or state.get("usedPercent") != 99:
-            raise AutonomousTestError(f"weekly hard-block used the wrong window: {state}")
-        result.notes.append("Explicit config enabled weekly hard-blocking at 99%.")
+        if state.get("status") != "open" or state.get("blockedWindow") is not None:
+            raise AutonomousTestError(f"explicit weekly advisory mode blocked unexpectedly: {state}")
+        if state.get("weeklyHardBlockEnabled") is not False:
+            raise AutonomousTestError(f"explicit weekly advisory mode was not retained: {state}")
+        result.notes.append("Explicit config opted out of the default weekly hard-block.")
 
     def scenario_weekly_only_positional_safety(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "weekly-only"
@@ -713,13 +1059,15 @@ print(json.dumps(payload))
         )
         state = self.state(state_dir)
         weekly = state.get("weekly") if isinstance(state.get("weekly"), dict) else {}
-        if state.get("status") != "open" or state.get("blockedWindow") is not None:
-            raise AutonomousTestError(f"weekly-only advisory state blocked unexpectedly: {state}")
+        if state.get("status") != "blocked" or state.get("blockedWindow") != "weekly":
+            raise AutonomousTestError(f"weekly-only default did not hard-block: {state}")
         if state.get("shortTerm") is not None or state.get("primary") is not None:
             raise AutonomousTestError(f"weekly primary slot was misclassified as short-term: {state}")
         if weekly.get("usedPercent") != 99 or weekly.get("sourceSlot") != "primary":
             raise AutonomousTestError(f"weekly-only window metadata was not preserved: {state}")
-        result.notes.append("A 99% weekly window in Codex's primary slot stayed advisory.")
+        if state.get("weeklyHardBlockEnabled") is not True:
+            raise AutonomousTestError(f"weekly hard-block default was not recorded: {state}")
+        result.notes.append("A 99% weekly window in Codex's primary slot hard-blocked by default.")
 
     def scenario_auxiliary_bucket_remains_advisory(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "auxiliary-bucket"
@@ -741,6 +1089,315 @@ print(json.dumps(payload))
             raise AutonomousTestError(f"auxiliary quota metadata was not retained: {state}")
         result.notes.append("A saturated auxiliary bucket was recorded without globally blocking Codex.")
 
+    def scenario_weekly_prompt_guard_waits_until_reset(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "weekly-prompt-guard"
+        transition_at = time.time() + 6
+        transition_env = self.env("app-server-weekly-transition")
+        transition_env["QUOTA_SENTRY_FAKE_TRANSITION_AT"] = str(transition_at)
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "poll",
+                "--state-dir",
+                str(state_dir),
+                "--reset-buffer-seconds",
+                "0",
+            ],
+            env=transition_env,
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "blocked" or state.get("blockedWindow") != "weekly":
+            raise AutonomousTestError(f"weekly prompt-guard fixture did not block: {state}")
+        blocked_until_raw = state.get("blockedUntil")
+        try:
+            blocked_until = datetime.fromisoformat(str(blocked_until_raw).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise AutonomousTestError(
+                f"weekly prompt-guard fixture has invalid blockedUntil: {blocked_until_raw!r}"
+            ) from exc
+        guard_started_at = datetime.now(timezone.utc)
+        expected_wait_seconds = (blocked_until - guard_started_at).total_seconds()
+        if expected_wait_seconds < 3.0:
+            raise AutonomousTestError(
+                f"weekly prompt-guard fixture left only {expected_wait_seconds:.2f}s before reset"
+            )
+        try:
+            guard_result = self.run(
+                result,
+                [
+                    str(QUOTA_SENTRY),
+                    "prompt-guard",
+                    "--state-dir",
+                    str(state_dir),
+                    "--source",
+                    "codex-app-server",
+                    "--reset-buffer-seconds",
+                    "0",
+                    "--interval-seconds",
+                    "1",
+                    "--critical-interval-seconds",
+                    "1",
+                    "--max-state-age-seconds",
+                    "30",
+                    "--require-fresh-state",
+                ],
+                env=transition_env,
+                timeout=15,
+            )
+            guard_duration = result.commands[-1].duration_seconds
+        finally:
+            self.run(
+                result,
+                [str(QUOTA_SENTRY), "stop", "--state-dir", str(state_dir)],
+                env=transition_env,
+            )
+        guard_completed_at = datetime.now(timezone.utc)
+        if guard_completed_at < blocked_until:
+            raise AutonomousTestError(
+                "weekly prompt-guard returned before blockedUntil: "
+                f"completed={guard_completed_at.isoformat()} blockedUntil={blocked_until.isoformat()}"
+            )
+        if guard_duration + 0.25 < expected_wait_seconds:
+            raise AutonomousTestError(
+                f"weekly prompt-guard waited {guard_duration:.2f}s, expected at least "
+                f"{expected_wait_seconds:.2f}s"
+            )
+        if guard_result.stdout.strip() or guard_result.stderr.strip():
+            raise AutonomousTestError(
+                "weekly prompt-guard polluted hook output: "
+                f"stdout={guard_result.stdout!r} stderr={guard_result.stderr!r}"
+            )
+        final_state = self.state(state_dir)
+        if final_state.get("status") != "open" or final_state.get("sourceStatus") != "open":
+            raise AutonomousTestError(
+                f"weekly prompt-guard returned without an authoritative open snapshot: {final_state}"
+            )
+        result.notes.append(
+            "The real prompt-guard stayed blocked past the estimate until the daemon recorded an authoritative open snapshot."
+        )
+
+    def scenario_hook_safety_deadline_fails_closed(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "hook-safety-deadline"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-weekly-only"),
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "blocked" or state.get("blockedWindow") != "weekly":
+            raise AutonomousTestError(f"hook safety fixture did not weekly-block: {state}")
+
+        guard_result = self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "guard",
+                "--state-dir",
+                str(state_dir),
+                "--state-only",
+                "--no-notify",
+                "--interval-seconds",
+                "5",
+                "--max-state-age-seconds",
+                "30",
+                "--fail-closed-after-seconds",
+                "1",
+            ],
+            env=self.env("all-sources-exit-failure"),
+            timeout=5,
+            expected_returncode=2,
+        )
+        duration = result.commands[-1].duration_seconds
+        if duration < 0.8 or duration > 3:
+            raise AutonomousTestError(
+                f"hook safety deadline fired outside the expected window: {duration:.2f}s"
+            )
+        if guard_result.stdout.strip():
+            raise AutonomousTestError(
+                f"fail-closed hook polluted stdout: {guard_result.stdout!r}"
+            )
+        expected_reason = (
+            "Quota Sentry: quota remains blocked; refusing to fail open at the hook safety deadline."
+        )
+        if guard_result.stderr.strip() != expected_reason:
+            raise AutonomousTestError(
+                f"fail-closed hook returned the wrong blocking reason: {guard_result.stderr!r}"
+            )
+        result.notes.append(
+            "A compressed weekly wait reached Quota Sentry's watchdog and returned Codex's blocking exit code 2."
+        )
+
+    def scenario_confirmed_block_survives_source_failure(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "sticky-block"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-weekly-only"),
+        )
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("all-sources-exit-failure"),
+        )
+        failed_state = self.state(state_dir)
+        if failed_state.get("status") != "blocked" or failed_state.get("sourceStatus") != "unknown":
+            raise AutonomousTestError(
+                f"source failure cleared a confirmed weekly block: {failed_state}"
+            )
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-open"),
+        )
+        opened_state = self.state(state_dir)
+        if opened_state.get("status") != "open" or opened_state.get("sourceStatus") != "open":
+            raise AutonomousTestError(
+                f"authoritative below-threshold snapshot did not clear the latch: {opened_state}"
+            )
+        result.notes.append(
+            "A confirmed weekly block survived total source failure and cleared only on valid below-threshold data."
+        )
+
+    def scenario_valid_block_wins_over_malformed_sibling(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "malformed-sibling"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-weekly-high-malformed-short"),
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "blocked" or state.get("blockedWindow") != "weekly":
+            raise AutonomousTestError(
+                f"malformed short-term data overrode valid weekly blocking evidence: {state}"
+            )
+        result.notes.append("Valid weekly blocking evidence took precedence over a malformed sibling window.")
+
+    def scenario_backend_exhaustion_without_windows_blocks(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "backend-exhaustion-no-windows"
+        env = self.env("app-server-account-exhausted-no-windows")
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=env,
+        )
+        state = self.state(state_dir)
+        if (
+            state.get("status") != "blocked"
+            or state.get("blockedWindow") != "account"
+            or state.get("rateLimitReachedType") != "rate_limit_reached"
+        ):
+            raise AutonomousTestError(
+                f"backend exhaustion without percentage windows did not block: {state}"
+            )
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "guard",
+                "--state-dir",
+                str(state_dir),
+                "--state-only",
+                "--no-notify",
+                "--fail-closed-after-seconds",
+                "0",
+            ],
+            env=env,
+            expected_returncode=2,
+        )
+        result.notes.append(
+            "A backend exhaustion signal with no quota windows produced a durable account block."
+        )
+
+    def scenario_fresh_unknown_state_fails_closed(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "fresh-unknown-fails-closed"
+        env = self.env("app-server-exit-failure")
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=env,
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "unknown":
+            raise AutonomousTestError(f"expected fresh unknown source state, got: {state}")
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "guard",
+                "--state-dir",
+                str(state_dir),
+                "--state-only",
+                "--require-fresh-state",
+                "--no-notify",
+            ],
+            env=env,
+            expected_returncode=2,
+        )
+        result.notes.append("A freshly timestamped unknown source state was denied by the hook guard.")
+
+    def scenario_omitted_backend_state_cannot_clear_latch(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "omitted-backend-state"
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-account-exhausted-no-windows"),
+        )
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-open"),
+        )
+        omitted_state = self.state(state_dir)
+        if omitted_state.get("status") != "blocked":
+            raise AutonomousTestError(
+                f"omitted backend state cleared a confirmed account latch: {omitted_state}"
+            )
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=self.env("app-server-explicit-backend-clear"),
+        )
+        cleared_state = self.state(state_dir)
+        if cleared_state.get("status") != "open":
+            raise AutonomousTestError(
+                f"explicit backend clear did not release account latch: {cleared_state}"
+            )
+        result.notes.append(
+            "Omitted backend state preserved the latch, while an explicit clear released it."
+        )
+
+    def scenario_ambiguous_replacement_buckets_fail_closed(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "ambiguous-replacement-buckets"
+        env = self.env("app-server-ambiguous-replacement-buckets")
+        self.run(
+            result,
+            [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
+            env=env,
+        )
+        state = self.state(state_dir)
+        if state.get("status") != "unknown":
+            raise AutonomousTestError(
+                f"ambiguous replacement buckets were accepted as open: {state}"
+            )
+        self.run(
+            result,
+            [
+                str(QUOTA_SENTRY),
+                "guard",
+                "--state-dir",
+                str(state_dir),
+                "--state-only",
+                "--require-fresh-state",
+                "--no-notify",
+            ],
+            env=env,
+            expected_returncode=2,
+        )
+        result.notes.append(
+            "Multiple renamed buckets without a canonical Codex identity were denied."
+        )
+
     def run_all(self) -> None:
         self.run_scenario("AT-001", "live Codex quota source smoke", self.scenario_live_quota_source_smoke)
         self.run_scenario("AT-002", "synthetic Codex app-server poll", self.scenario_synthetic_codex_app_server_poll)
@@ -752,10 +1409,54 @@ print(json.dumps(payload))
         self.run_scenario("AT-008", "CodexBar failure fails open", self.scenario_codexbar_failure_fails_open)
         self.run_scenario("AT-009", "state-only guard avoids live source", self.scenario_state_only_guard_avoids_live_source)
         self.run_scenario("AT-010", "prompt guard avoids live source", self.scenario_prompt_guard_avoids_live_source)
-        self.run_scenario("AT-011", "auto source falls back to CodexBar", self.scenario_auto_source_falls_back_to_codexbar)
-        self.run_scenario("AT-012", "weekly hard-block opt-in", self.scenario_weekly_hard_block_opt_in)
-        self.run_scenario("AT-013", "weekly-only positional safety", self.scenario_weekly_only_positional_safety)
+        self.run_scenario(
+            "AT-011",
+            "auto source never downgrades authority",
+            self.scenario_auto_source_never_downgrades_authority,
+        )
+        self.run_scenario("AT-012", "weekly advisory opt-out", self.scenario_weekly_advisory_opt_out)
+        self.run_scenario("AT-013", "weekly-only default hard-block", self.scenario_weekly_only_positional_safety)
         self.run_scenario("AT-014", "auxiliary bucket remains advisory", self.scenario_auxiliary_bucket_remains_advisory)
+        self.run_scenario(
+            "AT-015",
+            "weekly prompt guard waits for authoritative reset",
+            self.scenario_weekly_prompt_guard_waits_until_reset,
+        )
+        self.run_scenario(
+            "AT-016",
+            "hook safety deadline fails closed",
+            self.scenario_hook_safety_deadline_fails_closed,
+        )
+        self.run_scenario(
+            "AT-017",
+            "confirmed block survives source failure",
+            self.scenario_confirmed_block_survives_source_failure,
+        )
+        self.run_scenario(
+            "AT-018",
+            "valid block wins over malformed sibling",
+            self.scenario_valid_block_wins_over_malformed_sibling,
+        )
+        self.run_scenario(
+            "AT-019",
+            "backend exhaustion without windows blocks",
+            self.scenario_backend_exhaustion_without_windows_blocks,
+        )
+        self.run_scenario(
+            "AT-020",
+            "fresh unknown state fails closed",
+            self.scenario_fresh_unknown_state_fails_closed,
+        )
+        self.run_scenario(
+            "AT-021",
+            "omitted backend state cannot clear latch",
+            self.scenario_omitted_backend_state_cannot_clear_latch,
+        )
+        self.run_scenario(
+            "AT-022",
+            "ambiguous replacement buckets fail closed",
+            self.scenario_ambiguous_replacement_buckets_fail_closed,
+        )
 
     def write_report(self) -> Path:
         report_path = self.run_dir / "report.md"
@@ -804,7 +1505,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Quota Sentry autonomous E2E tests.")
     parser.add_argument("--list", action="store_true", help="List scenarios without running them.")
     parser.add_argument("--skip-live", action="store_true", help="Skip the real Codex quota source smoke scenario.")
-    parser.add_argument("--require-global-hook", action="store_true", help="Fail if ~/.codex/hooks.json does not reference this checkout.")
+    parser.add_argument(
+        "--require-global-hook",
+        action="store_true",
+        help="Fail unless the active Codex home has trusted hooks from this checkout.",
+    )
     parser.add_argument("--run-dir", default=None, help="Directory for test artifacts.")
     parser.add_argument("--cleanup", action="store_true", help="Remove run artifacts after a successful run.")
     return parser.parse_args()

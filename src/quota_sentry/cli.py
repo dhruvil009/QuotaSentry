@@ -150,6 +150,16 @@ def resolve_config_path(value: Optional[str]) -> Path:
     return Path(value).expanduser().resolve() if value else core.default_config_path()
 
 
+def _current_cwd_is_exempt(args: argparse.Namespace) -> bool:
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        return False
+
+    config = core.read_config(resolve_config_path(args.config_path))
+    return core.is_cwd_exempt(cwd, config.exempt_cwds)
+
+
 def script_path() -> Path:
     return Path(__file__).resolve().parents[2] / "scripts" / "quota-sentry"
 
@@ -635,6 +645,12 @@ def status_command(args: argparse.Namespace) -> int:
 
 def guard_command(args: argparse.Namespace) -> int:
     consume_hook_input(args)
+    if (
+        os.environ.get("QUOTA_SENTRY_DISABLE") == "1"
+        or _current_cwd_is_exempt(args)
+    ):
+        return 0
+
     state_dir = resolve_state_dir(args.state_dir)
     state_path = core.default_state_path(state_dir)
 
@@ -678,8 +694,12 @@ def guard_command(args: argparse.Namespace) -> int:
 
 def prompt_guard_command(args: argparse.Namespace) -> int:
     consume_hook_input(args)
-    if os.environ.get("QUOTA_SENTRY_DISABLE") == "1":
+    if (
+        os.environ.get("QUOTA_SENTRY_DISABLE") == "1"
+        or _current_cwd_is_exempt(args)
+    ):
         return 0
+
     args.quiet = True
     try:
         start_result = start_command(args)
@@ -820,6 +840,7 @@ def configure_command(args: argparse.Namespace) -> int:
     config = core.QuotaConfig(
         weekly_mode=weekly_mode,
         weekly_threshold_percent=weekly_threshold_percent,
+        exempt_cwds=current.exempt_cwds,
     )
     core.write_config(config_path, config)
     print(

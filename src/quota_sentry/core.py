@@ -74,6 +74,7 @@ _STATE_WRITE_LOCK = threading.Lock()
 class QuotaConfig:
     weekly_mode: str = DEFAULT_WEEKLY_MODE
     weekly_threshold_percent: int = DEFAULT_WEEKLY_THRESHOLD_PERCENT
+    exempt_cwds: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,43 @@ def _valid_percent(value: Any, default: int) -> int:
     return percent
 
 
+def _valid_exempt_cwds(value: Any) -> Tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        )
+    )
+
+
+def is_cwd_exempt(cwd: Path, exempt_cwds: Iterable[str]) -> bool:
+    try:
+        resolved_cwd = cwd.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+    for value in exempt_cwds:
+        if not isinstance(value, str):
+            continue
+
+        exempt_path = Path(value).expanduser()
+        if not exempt_path.is_absolute():
+            continue
+
+        try:
+            resolved_exempt = exempt_path.resolve()
+        except (OSError, RuntimeError):
+            continue
+
+        if resolved_cwd == resolved_exempt or resolved_exempt in resolved_cwd.parents:
+            return True
+
+    return False
+
+
 def config_from_payload(payload: Any) -> QuotaConfig:
     if not isinstance(payload, dict):
         return QuotaConfig()
@@ -260,17 +298,22 @@ def config_from_payload(payload: Any) -> QuotaConfig:
             payload.get("weeklyThresholdPercent"),
             DEFAULT_WEEKLY_THRESHOLD_PERCENT,
         ),
+        exempt_cwds=_valid_exempt_cwds(payload.get("exemptCwds")),
     )
 
 
 def config_to_payload(config: QuotaConfig) -> Dict[str, Any]:
-    return {
+    payload = {
         "weeklyMode": _valid_weekly_mode(config.weekly_mode),
         "weeklyThresholdPercent": _valid_percent(
             config.weekly_threshold_percent,
             DEFAULT_WEEKLY_THRESHOLD_PERCENT,
         ),
     }
+    exempt_cwds = _valid_exempt_cwds(list(config.exempt_cwds))
+    if exempt_cwds:
+        payload["exemptCwds"] = list(exempt_cwds)
+    return payload
 
 
 def read_config(path: Optional[Path] = None) -> QuotaConfig:

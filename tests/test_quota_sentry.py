@@ -1339,6 +1339,8 @@ class HookInstallTest(unittest.TestCase):
         for event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
             hook = merged["hooks"][event_name][-1]["hooks"][0]
             self.assertEqual(hook["timeout"], core.DEFAULT_HOOK_TIMEOUT_SECONDS)
+            self.assertIs(hook["notifyOnBlock"], True)
+            self.assertEqual(hook["statusMessage"], "QuotaSentry quota checkpoint")
             self.assertIn("--read-hook-input", hook["command"])
             self.assertIn("--require-fresh-state", hook["command"])
             self.assertIn(

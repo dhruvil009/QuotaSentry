@@ -1807,6 +1807,17 @@ def hook_entry(matcher: str, command: str, async_value: bool, timeout_seconds: i
     }
 
 
+def blocking_hook_entry(matcher: str, command: str, timeout_seconds: int) -> Dict[str, Any]:
+    entry = hook_entry(matcher, command, False, timeout_seconds)
+    entry["hooks"][0].update(
+        {
+            "notifyOnBlock": True,
+            "statusMessage": "QuotaSentry quota checkpoint",
+        }
+    )
+    return entry
+
+
 def quota_sentry_hook_commands(script_path: Path) -> Dict[str, str]:
     script = shlex.quote(str(script_path))
     fail_closed_option = (
@@ -1847,17 +1858,17 @@ def merge_codex_hooks(existing: Dict[str, Any], script_path: Path) -> Dict[str, 
         "SessionStart": hook_entry(
             "startup|resume|clear|compact", commands["SessionStart"], False, 30
         ),
-        "UserPromptSubmit": hook_entry(
-            "", commands["UserPromptSubmit"], False, DEFAULT_HOOK_TIMEOUT_SECONDS
+        "UserPromptSubmit": blocking_hook_entry(
+            "", commands["UserPromptSubmit"], DEFAULT_HOOK_TIMEOUT_SECONDS
         ),
-        "PreToolUse": hook_entry(
-            ".*", commands["PreToolUse"], False, DEFAULT_HOOK_TIMEOUT_SECONDS
+        "PreToolUse": blocking_hook_entry(
+            ".*", commands["PreToolUse"], DEFAULT_HOOK_TIMEOUT_SECONDS
         ),
-        "PostToolUse": hook_entry(
-            ".*", commands["PostToolUse"], False, DEFAULT_HOOK_TIMEOUT_SECONDS
+        "PostToolUse": blocking_hook_entry(
+            ".*", commands["PostToolUse"], DEFAULT_HOOK_TIMEOUT_SECONDS
         ),
-        "PreCompact": hook_entry(
-            ".*", commands["PreCompact"], False, DEFAULT_HOOK_TIMEOUT_SECONDS
+        "PreCompact": blocking_hook_entry(
+            ".*", commands["PreCompact"], DEFAULT_HOOK_TIMEOUT_SECONDS
         ),
     }
 

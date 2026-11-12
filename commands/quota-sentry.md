@@ -72,9 +72,9 @@ If the user asks to opt out of weekly enforcement, run:
 
 Weekly usage hard-blocks at `99%` by default, even when no config file exists. `configure --weekly-mode advisory` is an explicit opt-out. Persisted policy lives in `~/.config/quota-sentry/config.json` and does not require changing installed hook commands.
 
-Quota policy follows window duration and canonical limit identity, not Codex's `primary` or `secondary` slot names. Short-term windows up to 24 hours use the normal guard; seven-day windows use weekly policy; unfamiliar long-term canonical windows block at `100%`; durationless or canonically ambiguous data fails closed; auxiliary buckets remain advisory only when a canonical bucket is known.
+Quota policy follows window duration and canonical limit identity, not Codex's `primary` or `secondary` slot names. Short-term windows up to 24 hours use the normal guard; seven-day windows use weekly policy; unfamiliar long-term canonical windows block at `100%`; durationless or canonically ambiguous data becomes unavailable; auxiliary buckets remain advisory only when a canonical bucket is known.
 
-Installed hooks fail closed when cached source state is unknown, stale, or missing. Manual status and poll commands may still report `unknown` for diagnosis.
+Installed hooks preserve a confirmed block through unknown, stale, or missing source state. Without a retained block they request daemon recovery and continue rather than rejecting Codex work. Manual status and poll commands may still report `unknown` for diagnosis.
 
 Once an enforced block is confirmed, keep it latched through source failures, stale state, malformed sibling windows, and expired estimated reset timestamps. Release it only after an authoritative below-threshold snapshot for that policy window or an explicit policy opt-out.
 
@@ -83,7 +83,7 @@ Once an enforced block is confirmed, keep it latched through source failures, st
 Current hook model:
 
 - `SessionStart` runs `start --quiet` synchronously; the command returns after spawning the detached daemon.
-- `UserPromptSubmit` runs `prompt-guard`, which starts the daemon quietly, requires fresh cached state, and waits when blocked.
+- `UserPromptSubmit` runs `prompt-guard`, which starts the daemon quietly when possible, requests recovery for unhealthy cached state, and waits when blocked.
 - `PreToolUse` and `PostToolUse` run cache-only guards around supported local tools.
 - `PreCompact` guards model-backed compaction.
 

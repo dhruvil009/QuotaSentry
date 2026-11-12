@@ -217,6 +217,22 @@ def wait_for_fresh_quota_state(
         sleeper(min(0.1, remaining))
 
 
+def request_refresh_if_needed(
+    state_dir: Path,
+    *,
+    max_state_age_seconds: int = core.DEFAULT_MAX_STATE_AGE_SECONDS,
+) -> bool:
+    state = core.read_state(core.default_state_path(state_dir))
+    needs_refresh = state.get("status") != "open" or not core.state_is_fresh(
+        state,
+        max_state_age_seconds=max_state_age_seconds,
+    )
+    if not needs_refresh:
+        return False
+    core.request_refresh(core.default_refresh_request_path(state_dir))
+    return True
+
+
 def is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -447,6 +463,7 @@ def daemon_command(args: argparse.Namespace) -> int:
     own_pid = os.getpid()
     write_pid(pid_path, own_pid)
     state_path = core.default_state_path(state_dir)
+    refresh_request_path = core.default_refresh_request_path(state_dir)
 
     keep_running = True
 
@@ -459,6 +476,7 @@ def daemon_command(args: argparse.Namespace) -> int:
 
     try:
         while keep_running:
+            core.consume_refresh_request(refresh_request_path)
             decision = core.poll_once(
                 state_path,
                 threshold_percent=args.threshold_percent,
@@ -481,10 +499,15 @@ def daemon_command(args: argparse.Namespace) -> int:
                     sleep_seconds,
                     max(1, args.critical_interval_seconds),
                 )
-            for _ in range(sleep_seconds):
-                if not keep_running:
+            core.consume_refresh_request(refresh_request_path)
+            sleep_deadline = time.time() + sleep_seconds
+            while keep_running:
+                if core.consume_refresh_request(refresh_request_path):
                     break
-                time.sleep(1)
+                remaining = sleep_deadline - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(1, remaining))
         return 0
     finally:
         remove_pid_if_owned(pid_path, own_pid)
@@ -653,6 +676,10 @@ def guard_command(args: argparse.Namespace) -> int:
 
     state_dir = resolve_state_dir(args.state_dir)
     state_path = core.default_state_path(state_dir)
+    request_refresh_if_needed(
+        state_dir,
+        max_state_age_seconds=args.max_state_age_seconds,
+    )
 
     def poller():
         return core.poll_once(
@@ -702,32 +729,11 @@ def prompt_guard_command(args: argparse.Namespace) -> int:
 
     args.quiet = True
     try:
-        start_result = start_command(args)
-    except Exception as exc:
-        print(
-            "Quota Sentry: daemon startup failed; refusing to submit the prompt: "
-            f"{exc}",
-            file=sys.stderr,
-        )
-        return 2
-    if start_result != 0:
-        print(
-            "Quota Sentry: daemon startup failed; refusing to submit the prompt.",
-            file=sys.stderr,
-        )
-        return 2
-
-    state_path = core.default_state_path(resolve_state_dir(args.state_dir))
-    if not wait_for_fresh_quota_state(
-        state_path,
-        max_state_age_seconds=args.max_state_age_seconds,
-        timeout_seconds=args.startup_wait_seconds,
-    ):
-        print(
-            "Quota Sentry: daemon did not publish fresh quota state; refusing to submit the prompt.",
-            file=sys.stderr,
-        )
-        return 2
+        start_command(args)
+    except Exception:
+        # Cached enforcement remains authoritative for a retained block. A
+        # daemon health failure without one must never reject the prompt.
+        pass
 
     args.state_only = True
     args.no_notify = True

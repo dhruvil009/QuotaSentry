@@ -73,6 +73,20 @@ class ParseCodexbarUsageTest(unittest.TestCase):
 
         self.assertEqual(payload[0]["provider"], "codex")
 
+    def test_default_short_term_threshold_reserves_ten_percent(self):
+        below_threshold = core.parse_codexbar_usage(
+            codexbar_payload(used_percent=89),
+            now=NOW,
+        )
+        at_threshold = core.parse_codexbar_usage(
+            codexbar_payload(used_percent=90),
+            now=NOW,
+        )
+
+        self.assertEqual(core.DEFAULT_THRESHOLD_PERCENT, 90)
+        self.assertEqual(below_threshold.status, "open")
+        self.assertEqual(at_threshold.status, "blocked")
+
     def test_allows_when_five_hour_window_is_below_threshold(self):
         decision = core.parse_codexbar_usage(
             codexbar_payload(used_percent=94),
@@ -446,6 +460,17 @@ class ParseCodexbarUsageTest(unittest.TestCase):
 
 
 class StateTest(unittest.TestCase):
+    def test_refresh_request_is_coalesced_and_consumed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            refresh_path = core.default_refresh_request_path(Path(temp_dir))
+
+            core.request_refresh(refresh_path)
+            core.request_refresh(refresh_path)
+
+            self.assertTrue(refresh_path.exists())
+            self.assertTrue(core.consume_refresh_request(refresh_path))
+            self.assertFalse(core.consume_refresh_request(refresh_path))
+
     def test_state_round_trips_decision_as_json(self):
         decision = core.parse_codexbar_usage(
             codexbar_payload(used_percent=95),
@@ -895,7 +920,7 @@ class StateTest(unittest.TestCase):
         self.assertEqual(loaded["status"], "blocked")
         self.assertEqual(failures, [core.HOOK_FAIL_CLOSED_MESSAGE])
 
-    def test_should_not_block_from_invalid_state_timestamp(self):
+    def test_invalid_block_timestamp_uses_recovery_interval(self):
         state = {
             "status": "blocked",
             "updatedAt": "not-a-date",
@@ -904,7 +929,38 @@ class StateTest(unittest.TestCase):
 
         block_until = core.block_until_from_state(state, now=NOW, max_state_age_seconds=120)
 
-        self.assertIsNone(block_until)
+        self.assertEqual(block_until, NOW + timedelta(seconds=30))
+
+    def test_checkpoint_guard_waits_for_malformed_block_recovery(self):
+        state = {
+            "status": "blocked",
+            "updatedAt": "not-a-date",
+            "blockedUntil": "also-not-a-date",
+        }
+        current = {"value": NOW}
+        failures = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps(state))
+
+            def sleeper(seconds):
+                current["value"] += timedelta(seconds=seconds)
+                state_path.write_text(json.dumps({"status": "open"}))
+
+            result = core.wait_if_blocked(
+                state_path,
+                poller=lambda: self.fail("state-only guard must not live-poll"),
+                sleeper=sleeper,
+                state_only=True,
+                require_fresh_state=True,
+                now_func=lambda: current["value"],
+                fail_closed_output=failures.append,
+                notify=False,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(failures, [])
 
     def test_terminal_notice_file_errors_are_ignored(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1043,7 +1099,7 @@ class StateTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
 
-    def test_checkpoint_guard_fails_closed_when_nonblocked_cache_is_stale(self):
+    def test_checkpoint_guard_allows_when_nonblocked_cache_is_stale(self):
         state = {
             "status": "open",
             "updatedAt": "2026-06-01T16:00:00Z",
@@ -1063,10 +1119,10 @@ class StateTest(unittest.TestCase):
                 fail_closed_output=failures.append,
             )
 
-        self.assertEqual(result, 2)
-        self.assertEqual(failures, [core.HOOK_STATE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result, 0)
+        self.assertEqual(failures, [])
 
-    def test_checkpoint_guard_fails_closed_when_fresh_state_is_unknown(self):
+    def test_checkpoint_guard_allows_when_fresh_state_is_unknown(self):
         state = {
             "status": "unknown",
             "updatedAt": "2026-06-01T16:29:59Z",
@@ -1087,8 +1143,26 @@ class StateTest(unittest.TestCase):
                 fail_closed_output=failures.append,
             )
 
-        self.assertEqual(result, 2)
-        self.assertEqual(failures, [core.HOOK_STATE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result, 0)
+        self.assertEqual(failures, [])
+
+    def test_checkpoint_guard_allows_when_cache_is_missing(self):
+        failures = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+
+            result = core.wait_if_blocked(
+                state_path,
+                poller=lambda: self.fail("state-only guard must not live-poll"),
+                state_only=True,
+                require_fresh_state=True,
+                now_func=lambda: NOW,
+                fail_closed_output=failures.append,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(failures, [])
 
     def test_state_only_guard_waits_on_fresh_blocked_state(self):
         state = {
@@ -1679,6 +1753,61 @@ class PollIntervalTest(unittest.TestCase):
         self.assertEqual(near, 60)
         self.assertEqual(critical, 30)
 
+    def test_short_term_window_uses_one_minute_baseline(self):
+        short_term = core.QuotaWindow(
+            name="short-term",
+            used_percent=20,
+            window_minutes=300,
+            resets_at=NOW + timedelta(hours=5),
+            kind=core.WINDOW_KIND_SHORT_TERM,
+        )
+        decision = core.QuotaDecision(
+            status="open",
+            reason="open",
+            used_percent=20,
+            short_term_window=short_term,
+            quota_windows=(short_term,),
+        )
+
+        interval = core.next_poll_interval_seconds(
+            decision,
+            base_interval_seconds=300,
+            near_threshold_percent=85,
+            near_interval_seconds=60,
+            critical_threshold_percent=93,
+            critical_interval_seconds=30,
+        )
+
+        self.assertEqual(interval, 60)
+
+    def test_weekly_only_window_keeps_five_minute_baseline(self):
+        weekly = core.QuotaWindow(
+            name="weekly",
+            used_percent=20,
+            window_minutes=10080,
+            resets_at=NOW + timedelta(days=7),
+            kind=core.WINDOW_KIND_WEEKLY,
+        )
+        decision = core.QuotaDecision(
+            status="open",
+            reason="open",
+            used_percent=20,
+            weekly_window=weekly,
+            quota_windows=(weekly,),
+            weekly_hard_block_enabled=True,
+        )
+
+        interval = core.next_poll_interval_seconds(
+            decision,
+            base_interval_seconds=300,
+            near_threshold_percent=85,
+            near_interval_seconds=60,
+            critical_threshold_percent=93,
+            critical_interval_seconds=30,
+        )
+
+        self.assertEqual(interval, 300)
+
     def test_weekly_advisory_usage_does_not_tighten_poll_interval(self):
         decision = core.QuotaDecision(
             status="open",
@@ -2046,6 +2175,32 @@ class DaemonStartTest(unittest.TestCase):
         self.assertEqual(hook_input.tell(), 1024 * 1024)
         self.assertFalse(args.read_hook_input)
 
+    def test_stale_cache_guard_requests_daemon_refresh_without_denial(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            core.write_json_atomic(
+                core.default_state_path(state_dir),
+                {
+                    "status": "open",
+                    "updatedAt": "2026-06-01T16:00:00Z",
+                },
+            )
+            args = cli.build_parser().parse_args(
+                [
+                    "guard",
+                    "--state-only",
+                    "--require-fresh-state",
+                    "--state-dir",
+                    temp_dir,
+                ]
+            )
+
+            with mock.patch.object(core, "utc_now", return_value=NOW):
+                result = cli.guard_command(args)
+
+            self.assertEqual(result, 0)
+            self.assertTrue(core.default_refresh_request_path(state_dir).exists())
+
     def test_stop_json_watchdog_returns_valid_compact_stop_output(self):
         args = cli.build_parser().parse_args(
             ["guard", "--state-only", "--fail-closed-format", "stop-json"]
@@ -2236,7 +2391,7 @@ class DaemonStartTest(unittest.TestCase):
         config_fingerprint = cli.config_path_fingerprint(args.config_path)
         base_command = (
             f"python {cli.script_path()} daemon --state-dir /tmp/state "
-            "--threshold-percent 95 --reset-buffer-seconds 60 --source auto "
+            "--threshold-percent 90 --reset-buffer-seconds 60 --source auto "
             "--interval-seconds 300 --near-threshold-percent 85 "
             "--near-interval-seconds 60 --critical-threshold-percent 93 "
             "--critical-interval-seconds 30 --runtime-fingerprint current "
@@ -2275,7 +2430,6 @@ class DaemonStartTest(unittest.TestCase):
         args = cli.build_parser().parse_args(["prompt-guard"])
 
         with mock.patch.object(cli, "start_command", return_value=0) as start, \
-            mock.patch.object(cli, "wait_for_fresh_quota_state", return_value=True) as fresh, \
             mock.patch.object(cli, "guard_command", return_value=0) as guard:
             result = cli.prompt_guard_command(args)
 
@@ -2284,7 +2438,6 @@ class DaemonStartTest(unittest.TestCase):
         self.assertTrue(args.state_only)
         self.assertTrue(args.no_notify)
         start.assert_called_once_with(args)
-        fresh.assert_called_once()
         guard.assert_called_once_with(args)
 
     def test_prompt_guard_emergency_bypass_skips_daemon_and_state_checks(self):
@@ -2304,31 +2457,27 @@ class DaemonStartTest(unittest.TestCase):
         fresh.assert_not_called()
         guard.assert_not_called()
 
-    def test_prompt_guard_fails_closed_when_daemon_start_fails(self):
+    def test_prompt_guard_uses_cached_enforcement_when_daemon_start_fails(self):
         args = cli.build_parser().parse_args(["prompt-guard"])
 
         with mock.patch.object(cli, "start_command", return_value=7), \
-            mock.patch.object(cli, "guard_command") as guard, \
-            mock.patch("sys.stderr", new_callable=StringIO) as stderr:
+            mock.patch.object(cli, "guard_command", return_value=0) as guard:
             result = cli.prompt_guard_command(args)
 
-        self.assertEqual(result, 2)
-        self.assertIn("refusing to submit the prompt", stderr.getvalue())
-        guard.assert_not_called()
+        self.assertEqual(result, 0)
+        guard.assert_called_once_with(args)
 
-    def test_prompt_guard_fails_closed_when_daemon_does_not_publish_fresh_state(self):
+    def test_prompt_guard_does_not_wait_for_fresh_unlatched_state(self):
         args = cli.build_parser().parse_args(["prompt-guard"])
 
         with mock.patch.object(cli, "start_command", return_value=0), mock.patch.object(
-            cli, "wait_for_fresh_quota_state", return_value=False
-        ), mock.patch.object(cli, "guard_command") as guard, mock.patch(
-            "sys.stderr", new_callable=StringIO
-        ) as stderr:
+            cli, "wait_for_fresh_quota_state"
+        ) as fresh, mock.patch.object(cli, "guard_command", return_value=0) as guard:
             result = cli.prompt_guard_command(args)
 
-        self.assertEqual(result, 2)
-        self.assertIn("fresh quota state", stderr.getvalue())
-        guard.assert_not_called()
+        self.assertEqual(result, 0)
+        fresh.assert_not_called()
+        guard.assert_called_once_with(args)
 
 
 class CliStatusTest(unittest.TestCase):
@@ -2504,9 +2653,13 @@ class AutonomousHarnessTest(unittest.TestCase):
         self.assertIn("AT-017 confirmed block survives source failure", result.stdout)
         self.assertIn("AT-018 valid block wins over malformed sibling", result.stdout)
         self.assertIn("AT-019 backend exhaustion without windows blocks", result.stdout)
-        self.assertIn("AT-020 fresh unknown state fails closed", result.stdout)
+        self.assertIn("AT-020 fresh unknown state recovers without denial", result.stdout)
         self.assertIn("AT-021 omitted backend state cannot clear latch", result.stdout)
-        self.assertIn("AT-022 ambiguous replacement buckets fail closed", result.stdout)
+        self.assertIn(
+            "AT-022 ambiguous replacement buckets recover without denial",
+            result.stdout,
+        )
+        self.assertIn("AT-023 adaptive daemon cadence and refresh wakeup", result.stdout)
 
 
 if __name__ == "__main__":

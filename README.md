@@ -61,10 +61,10 @@ flowchart LR
     state --> decision{Enforcement state}
     decision -->|confirmed block| wait[Wait for authoritative open snapshot]
     decision -->|fresh authoritative open| open[Allow Codex]
-    decision -->|unknown, stale, or missing| stop[Fail closed]
+    decision -->|unknown, stale, or missing without latch| recover[Request refresh and continue]
 ```
 
-The daemon polls quota in the background and writes a cached decision. Codex hooks consume their JSON input immediately, then read cached state synchronously before prompts, tool execution, tool completion, and compaction. Hook paths do not normally invoke live quota sources.
+The daemon polls quota in the background and writes a cached decision. Codex hooks consume their JSON input immediately, then read cached state synchronously before prompts, tool execution, tool completion, and compaction. Hook paths do not invoke live quota sources; stale, unknown, or missing unlatched state writes a coalesced daemon refresh request and returns success.
 
 Once a quota block is confirmed, source failures, malformed sibling windows, stale timestamps, and an expired estimated reset time cannot clear it. Codex must report the same policy window below threshold, or the user must explicitly opt out of that policy.
 
@@ -77,19 +77,19 @@ The `v0.1.x` line supports Codex only:
 - Retains explicit `--source codexbar` only as an optional compatibility and test adapter.
 - Reads the canonical `rateLimits` bucket and preserves the newer `rateLimitsByLimitId` multi-bucket view when Codex provides it.
 - Classifies canonical windows by duration, never by whether Codex placed them in `primary` or `secondary`.
-- Treats windows up to 24 hours as short-term and begins blocking at `usedPercent >= 95`.
+- Treats windows up to 24 hours as short-term and begins blocking at `usedPercent >= 90`, preserving 10% of the window.
 - Treats the seven-day window (`windowMinutes: 10080`) as weekly and hard-blocks at `usedPercent >= 99` by default.
 - Hard-blocks explicit backend exhaustion signals such as `rateLimitReachedType` or `spendControlReached`, including responses that contain no percentage windows.
 - Supports explicit advisory mode for users who want weekly status without weekly enforcement.
-- Records unfamiliar long-term canonical windows and blocks them at `100%` as a schema-drift fail-safe. A durationless canonical window is `unknown` and fails closed because Quota Sentry cannot safely select a policy. Auxiliary non-canonical limit IDs remain advisory when a canonical Codex bucket is also present.
-- Reports missing, malformed, unavailable, or canonically ambiguous source data as `unknown`; installed lifecycle hooks fail closed on that state even when it is freshly timestamped.
-- Fails closed when a lifecycle checkpoint cannot read fresh cached state.
+- Records unfamiliar long-term canonical windows and blocks them at `100%` as a schema-drift fail-safe. A durationless canonical window is `unknown` because Quota Sentry cannot safely select a policy. Auxiliary non-canonical limit IDs remain advisory when a canonical Codex bucket is also present.
+- Reports missing, malformed, unavailable, or canonically ambiguous source data as `unknown`. Without a retained block, lifecycle hooks request asynchronous recovery and continue instead of denying Codex work.
+- Keeps a previously confirmed block latched through stale, unknown, missing, or malformed source observations.
 - Converts unexpected hook-path exceptions into event-valid denials instead of leaving Codex to treat exit code `1` as a failed guard.
 - Preserves valid blocking evidence when another returned quota window is malformed.
 
 Codex may add, remove, or reorder quota windows. `primary` and `secondary` are retained only as source-slot metadata. For example, if Codex temporarily exposes only a weekly window in `primary`, Quota Sentry reports weekly usage and does not reinterpret it as a short-term limit.
 
-The background daemon polls every five minutes by default, tightens its cadence near the quota threshold, and checks every 30 seconds while a durable block is active. Waiting hooks also re-read local state at least every 30 seconds, allowing an ad hoc reset to release without waiting for the original reset estimate.
+The background daemon polls every five minutes when Codex exposes only weekly quota. The presence of any canonical short-term window reduces the baseline to one minute; near-critical usage, source recovery, and durable blocks use at most 30 seconds. Waiting hooks also re-read local state at least every 30 seconds, allowing an ad hoc reset to release without waiting for the original reset estimate.
 
 ## Commands
 
@@ -171,7 +171,7 @@ Quota Sentry uses a global hook file so installation, trust, and timeout setting
 Installed hooks:
 
 - `SessionStart`: starts the detached background daemon through a synchronous quiet hook.
-- `UserPromptSubmit`: ensures the daemon is running, requires fresh state, and waits when enforcement is blocked.
+- `UserPromptSubmit`: attempts to ensure the daemon is running, requests recovery for unhealthy unlatched state, and waits only when enforcement is already blocked.
 - `PreToolUse`: checks cached state before supported local tool execution.
 - `PostToolUse`: checks again after supported local tools finish, before Codex resumes model work.
 - `PreCompact`: checks before automatic or manual context compaction can make another model request.
@@ -204,9 +204,10 @@ Files:
 - `state.json.lock`: process lock that makes concurrent read/merge/write updates safe.
 - `quota-sentry.pid`: daemon pid.
 - `quota-sentry.daemon.lock`: lifetime lock that prevents duplicate daemon owners.
+- `refresh.request`: coalesced request for the detached daemon to poll before its normal deadline.
 - `quota-sentry.log`: daemon output.
 
-Each prompt hook also checks that the running daemon uses the current Quota Sentry code, authoritative source, policy path, thresholds, reset buffer, and polling bounds. It replaces an older or weaker daemon before allowing prompt submission.
+Each prompt hook also checks whether the running daemon uses the current Quota Sentry code, authoritative source, policy path, thresholds, reset buffer, and polling bounds. It attempts to replace an older or weaker daemon, but daemon health by itself does not reject a prompt when no quota block has been confirmed.
 
 Config lives at:
 
@@ -228,7 +229,7 @@ Run autonomous E2E tests:
 ./scripts/autonomous-test
 ```
 
-The autonomous harness runs one live Codex quota-source smoke poll, then uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. Coverage includes weekly-only responses, authoritative reset transitions, backend exhaustion without percentage windows, source-authority downgrade attempts, source failure during a confirmed block, omitted backend fields, canonical-bucket ambiguity, malformed sibling windows, hook watchdog behavior, and global hook configuration. It writes a report under `.quota-sentry-runs/`.
+The autonomous harness runs one live Codex quota-source smoke poll, then uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. Coverage includes weekly-only responses, adaptive short-term polling, daemon refresh wakeups, unlatched source recovery without denial, authoritative reset transitions, backend exhaustion without percentage windows, source-authority downgrade attempts, source failure during a confirmed block, omitted backend fields, canonical-bucket ambiguity, malformed sibling windows, hook watchdog behavior, and global hook configuration. It writes a report under `.quota-sentry-runs/`.
 
 For clean clones without installed Codex hooks, the global hook scenario is skipped by default. Use `./scripts/autonomous-test --skip-live --require-global-hook` when you specifically need to verify that this checkout is installed in the active Codex home.
 

@@ -28,7 +28,7 @@ WEEKLY_MODE_HARD_BLOCK = "hard-block"
 DEFAULT_WEEKLY_MODE = WEEKLY_MODE_HARD_BLOCK
 DEFAULT_USAGE_SOURCE = AUTO_SOURCE
 DEFAULT_CODEXBAR_SOURCE = "cli"
-DEFAULT_THRESHOLD_PERCENT = 95
+DEFAULT_THRESHOLD_PERCENT = 90
 DEFAULT_WINDOW_MINUTES = 300
 DEFAULT_WEEKLY_WINDOW_MINUTES = 10080
 DEFAULT_WEEKLY_WINDOW_TOLERANCE_MINUTES = 60
@@ -177,6 +177,27 @@ def default_log_path(state_dir: Optional[Path] = None) -> Path:
 
 def default_daemon_lock_path(state_dir: Optional[Path] = None) -> Path:
     return (state_dir or cache_dir()) / "quota-sentry.daemon.lock"
+
+
+def default_refresh_request_path(state_dir: Optional[Path] = None) -> Path:
+    return (state_dir or cache_dir()) / "refresh.request"
+
+
+def request_refresh(path: Path) -> None:
+    try:
+        write_bytes_atomic(path, b"refresh\n")
+    except OSError:
+        pass
+
+
+def consume_refresh_request(path: Path) -> bool:
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:
@@ -1225,7 +1246,7 @@ def block_until_from_state(
     updated_at = parse_timestamp(state.get("updatedAt"))
     blocked_until = parse_timestamp(state.get("blockedUntil"))
     if not updated_at or not blocked_until:
-        return None
+        return current_time + timedelta(seconds=DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS)
     del max_state_age_seconds
     if blocked_until <= current_time:
         return current_time + timedelta(seconds=DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS)
@@ -1647,11 +1668,13 @@ def next_poll_interval_seconds(
     critical_interval = max(1, int(critical_interval_seconds))
 
     used_values: List[Optional[Percent]] = []
+    has_short_term_window = decision.short_term_window is not None
     if decision.quota_windows:
         for window in decision.quota_windows:
             if not window.is_default_limit:
                 continue
             if window.kind == WINDOW_KIND_SHORT_TERM:
+                has_short_term_window = True
                 used_values.append(window.used_percent)
             elif window.kind in {
                 WINDOW_KIND_ACCOUNT,
@@ -1670,15 +1693,18 @@ def next_poll_interval_seconds(
             used_values.append(decision.short_term_window.used_percent)
         if decision.weekly_hard_block_enabled and decision.weekly_window is not None:
             used_values.append(decision.weekly_window.used_percent)
+    effective_base_interval = (
+        min(base_interval, near_interval) if has_short_term_window else base_interval
+    )
     numeric_used_values = [used for used in used_values if used is not None]
     if not numeric_used_values:
-        return base_interval
+        return effective_base_interval
     used = max(numeric_used_values)
     if used >= critical_threshold_percent:
-        return min(base_interval, critical_interval)
+        return min(effective_base_interval, critical_interval)
     if used >= near_threshold_percent:
-        return min(base_interval, near_interval)
-    return base_interval
+        return min(effective_base_interval, near_interval)
+    return effective_base_interval
 
 
 def wait_if_blocked(
@@ -1713,21 +1739,9 @@ def wait_if_blocked(
         state = read_state(state_path)
         current_time = now_func()
         polled_this_iteration = False
-        if (
-            require_fresh_state
-            and state.get("status") != "blocked"
-            and (
-                state.get("status") != "open"
-                or not state_is_fresh(
-                    state,
-                    now=current_time,
-                    max_state_age_seconds=max_state_age_seconds,
-                )
-            )
-        ):
-            if fail_closed_output is not None:
-                fail_closed_output(HOOK_STATE_UNAVAILABLE_MESSAGE)
-            return fail_closed_exit_code
+        # Older installed hooks pass require_fresh_state. Keep accepting the
+        # option, but telemetry health without a retained block must not deny a
+        # Codex operation. A confirmed block remains latched below.
         if waited_once and state.get("status") != "blocked":
             return 0
         saved_blocked_until = parse_timestamp(state.get("blockedUntil"))
@@ -1745,10 +1759,6 @@ def wait_if_blocked(
         block_until = block_until_from_state(state, now=current_time, max_state_age_seconds=max_state_age_seconds)
         if block_until is None:
             if state_only:
-                if require_fresh_state and state.get("status") == "blocked":
-                    if fail_closed_output is not None:
-                        fail_closed_output(HOOK_STATE_UNAVAILABLE_MESSAGE)
-                    return fail_closed_exit_code
                 return 0
             if not polled_this_iteration:
                 poller()

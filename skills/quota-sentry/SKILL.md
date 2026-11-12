@@ -16,10 +16,10 @@ Daemon enforcement supports macOS and Linux. Do not install it as an enforcement
 - Retains explicit `--source codexbar` only as an optional compatibility and test adapter.
 - Reads both the canonical bucket and `rateLimitsByLimitId` when available.
 - Classifies quota policy by duration, not the `primary` or `secondary` source slot.
-- Guards canonical short-term windows up to 24 hours and starts blocking at `usedPercent >= 95`.
+- Guards canonical short-term windows up to 24 hours and starts blocking at `usedPercent >= 90`, preserving 10% of the window.
 - Hard-blocks the seven-day window (`windowMinutes: 10080`) at `usedPercent >= 99` by default.
 - Hard-blocks explicit backend exhaustion signals even when no percentage window is returned.
-- Blocks unfamiliar long-term canonical windows at `100%` as a schema-drift fail-safe. Durationless or canonically ambiguous data fails closed; auxiliary buckets remain advisory only when a canonical bucket is known.
+- Blocks unfamiliar long-term canonical windows at `100%` as a schema-drift fail-safe. Durationless or canonically ambiguous data becomes unavailable; auxiliary buckets remain advisory only when a canonical bucket is known.
 - Supports explicit weekly advisory mode as an opt-out from enforcement.
 - Uses `resetsAt` plus a 60-second buffer as an initial wait estimate.
 - Latches a confirmed block until Codex reports that policy window below threshold.
@@ -27,9 +27,9 @@ Daemon enforcement supports macOS and Linux. Do not install it as an enforcement
 
 ## Important Constraint
 
-The background daemon observes quota and writes state every five minutes by default, tightening its cadence near the quota threshold. Actual blocking requires a synchronous guard path to run from a global Codex hook or wrapper. Do not claim that the daemon can interrupt an already-running model request.
+The background daemon observes quota every five minutes for weekly-only state, every minute when a short-term window is present, and at most every 30 seconds for recovery, near-critical usage, or a retained block. Actual blocking requires a synchronous guard path to run from a global Codex hook or wrapper. Do not claim that the daemon can interrupt an already-running model request.
 
-Installed Codex hooks consume hook stdin immediately and read cached daemon state. `SessionStart` runs `start --quiet` synchronously. `UserPromptSubmit` uses `prompt-guard`; `PreToolUse`, `PostToolUse`, and `PreCompact` use cache-only guards and fail closed when cached state is stale or missing.
+Installed Codex hooks consume hook stdin immediately and read cached daemon state. `SessionStart` runs `start --quiet` synchronously. `UserPromptSubmit` uses `prompt-guard`; `PreToolUse`, `PostToolUse`, and `PreCompact` use cache-only guards. They preserve a retained block through telemetry failure, but request daemon recovery and continue when stale, unknown, or missing state has no retained block.
 
 The guard cannot interrupt a model request already in flight, and Codex documents specialized or hosted tool paths as possible exceptions to local tool hooks. Do not claim stronger enforcement than the host lifecycle provides.
 

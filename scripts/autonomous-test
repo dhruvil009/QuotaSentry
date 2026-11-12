@@ -40,9 +40,10 @@ SCENARIOS = [
     ("AT-017", "confirmed block survives source failure"),
     ("AT-018", "valid block wins over malformed sibling"),
     ("AT-019", "backend exhaustion without windows blocks"),
-    ("AT-020", "fresh unknown state fails closed"),
+    ("AT-020", "fresh unknown state recovers without denial"),
     ("AT-021", "omitted backend state cannot clear latch"),
-    ("AT-022", "ambiguous replacement buckets fail closed"),
+    ("AT-022", "ambiguous replacement buckets recover without denial"),
+    ("AT-023", "adaptive daemon cadence and refresh wakeup"),
 ]
 
 
@@ -114,6 +115,9 @@ elif mode == "app-server-weekly-high":
     weekly_used = 99
 elif mode == "app-server-weekly-only":
     weekly_used = 99
+    weekly_only = True
+elif mode == "app-server-weekly-only-open":
+    weekly_used = 20
     weekly_only = True
 elif mode == "app-server-weekly-only-short-reset":
     weekly_used = 99
@@ -757,7 +761,7 @@ print(json.dumps(payload))
             if "--read-hook-input" not in event_hook.get("command", ""):
                 raise AutonomousTestError(f"{event_name} hook does not consume Codex hook stdin")
             if "--require-fresh-state" not in event_hook.get("command", ""):
-                raise AutonomousTestError(f"{event_name} hook does not fail closed on stale state")
+                raise AutonomousTestError(f"{event_name} hook is missing guard compatibility mode")
         post_tool_command = merged["hooks"]["PostToolUse"][-1]["hooks"][0].get("command", "")
         if "--fail-closed-format block-json" not in post_tool_command:
             raise AutonomousTestError("PostToolUse hook does not block its result on watchdog")
@@ -821,7 +825,9 @@ print(json.dumps(payload))
             if "--read-hook-input" not in event_hook.get("command", ""):
                 raise AutonomousTestError(f"global {event_name} hook does not consume hook stdin")
             if "--require-fresh-state" not in event_hook.get("command", ""):
-                raise AutonomousTestError(f"global {event_name} hook does not fail closed on stale state")
+                raise AutonomousTestError(
+                    f"global {event_name} hook is missing guard compatibility mode"
+                )
         post_tool_command = payload["hooks"]["PostToolUse"][-1]["hooks"][0].get("command", "")
         if "--fail-closed-format block-json" not in post_tool_command:
             raise AutonomousTestError("global PostToolUse hook does not block its result on watchdog")
@@ -1309,8 +1315,8 @@ print(json.dumps(payload))
             "A backend exhaustion signal with no quota windows produced a durable account block."
         )
 
-    def scenario_fresh_unknown_state_fails_closed(self, result: ScenarioResult) -> None:
-        state_dir = self.run_dir / "fresh-unknown-fails-closed"
+    def scenario_fresh_unknown_state_recovers_without_denial(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "fresh-unknown-recovers"
         env = self.env("app-server-exit-failure")
         self.run(
             result,
@@ -1332,9 +1338,15 @@ print(json.dumps(payload))
                 "--no-notify",
             ],
             env=env,
-            expected_returncode=2,
         )
-        result.notes.append("A freshly timestamped unknown source state was denied by the hook guard.")
+        refresh_request = state_dir / "refresh.request"
+        if not refresh_request.exists():
+            raise AutonomousTestError(
+                "unknown source state returned without requesting daemon recovery"
+            )
+        result.notes.append(
+            "A freshly timestamped unknown source state returned success and requested daemon recovery."
+        )
 
     def scenario_omitted_backend_state_cannot_clear_latch(self, result: ScenarioResult) -> None:
         state_dir = self.run_dir / "omitted-backend-state"
@@ -1367,7 +1379,9 @@ print(json.dumps(payload))
             "Omitted backend state preserved the latch, while an explicit clear released it."
         )
 
-    def scenario_ambiguous_replacement_buckets_fail_closed(self, result: ScenarioResult) -> None:
+    def scenario_ambiguous_replacement_buckets_recover_without_denial(
+        self, result: ScenarioResult
+    ) -> None:
         state_dir = self.run_dir / "ambiguous-replacement-buckets"
         env = self.env("app-server-ambiguous-replacement-buckets")
         self.run(
@@ -1392,10 +1406,86 @@ print(json.dumps(payload))
                 "--no-notify",
             ],
             env=env,
-            expected_returncode=2,
         )
+        if not (state_dir / "refresh.request").exists():
+            raise AutonomousTestError(
+                "ambiguous replacement buckets returned without requesting daemon recovery"
+            )
         result.notes.append(
-            "Multiple renamed buckets without a canonical Codex identity were denied."
+            "Multiple renamed buckets without a canonical Codex identity stayed unknown, "
+            "requested recovery, and did not deny Codex work."
+        )
+
+    def scenario_adaptive_daemon_cadence(self, result: ScenarioResult) -> None:
+        short_dir = self.run_dir / "adaptive-short-term"
+        weekly_dir = self.run_dir / "adaptive-weekly-only"
+        common = [
+            "--interval-seconds",
+            "4",
+            "--near-interval-seconds",
+            "1",
+            "--critical-interval-seconds",
+            "1",
+        ]
+
+        def log_lines(state_dir: Path) -> List[str]:
+            log_path = state_dir / "quota-sentry.log"
+            if not log_path.exists():
+                return []
+            return [line for line in log_path.read_text().splitlines() if line.strip()]
+
+        try:
+            self.run(
+                result,
+                [str(QUOTA_SENTRY), "start", "--state-dir", str(short_dir), *common],
+                env=self.env("app-server-open"),
+            )
+            self.run(
+                result,
+                [str(QUOTA_SENTRY), "start", "--state-dir", str(weekly_dir), *common],
+                env=self.env("app-server-weekly-only-open"),
+            )
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if log_lines(short_dir) and log_lines(weekly_dir):
+                    break
+                time.sleep(0.05)
+            if not log_lines(short_dir) or not log_lines(weekly_dir):
+                raise AutonomousTestError("adaptive cadence daemons did not publish initial state")
+
+            time.sleep(1.4)
+            short_count = len(log_lines(short_dir))
+            weekly_count = len(log_lines(weekly_dir))
+            if short_count < 2:
+                raise AutonomousTestError(
+                    f"short-term daemon did not use tighter cadence: {short_count} polls"
+                )
+            if weekly_count != 1:
+                raise AutonomousTestError(
+                    f"weekly-only daemon unexpectedly used short-term cadence: {weekly_count} polls"
+                )
+
+            (weekly_dir / "refresh.request").write_text("refresh\n")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and len(log_lines(weekly_dir)) < 2:
+                time.sleep(0.05)
+            if len(log_lines(weekly_dir)) < 2:
+                raise AutonomousTestError("refresh request did not wake weekly-only daemon")
+        finally:
+            for state_dir, mode in (
+                (short_dir, "app-server-open"),
+                (weekly_dir, "app-server-weekly-only-open"),
+            ):
+                self.run(
+                    result,
+                    [str(QUOTA_SENTRY), "stop", "--state-dir", str(state_dir)],
+                    env=self.env(mode),
+                )
+
+        result.notes.append(
+            "Short-term state used the tighter cadence, weekly-only state retained the base "
+            "cadence, and a coalesced refresh request woke the weekly daemon early."
         )
 
     def run_all(self) -> None:
@@ -1444,8 +1534,8 @@ print(json.dumps(payload))
         )
         self.run_scenario(
             "AT-020",
-            "fresh unknown state fails closed",
-            self.scenario_fresh_unknown_state_fails_closed,
+            "fresh unknown state recovers without denial",
+            self.scenario_fresh_unknown_state_recovers_without_denial,
         )
         self.run_scenario(
             "AT-021",
@@ -1454,8 +1544,13 @@ print(json.dumps(payload))
         )
         self.run_scenario(
             "AT-022",
-            "ambiguous replacement buckets fail closed",
-            self.scenario_ambiguous_replacement_buckets_fail_closed,
+            "ambiguous replacement buckets recover without denial",
+            self.scenario_ambiguous_replacement_buckets_recover_without_denial,
+        )
+        self.run_scenario(
+            "AT-023",
+            "adaptive daemon cadence and refresh wakeup",
+            self.scenario_adaptive_daemon_cadence,
         )
 
     def write_report(self) -> Path:

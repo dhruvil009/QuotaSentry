@@ -31,7 +31,7 @@ When adding support for a harness such as Claude Code or OpenCode:
 - Document the harness version, quota source, hook or wrapper entrypoint, and install/uninstall steps.
 - Use structured quota data when available; avoid scraping terminal text unless there is no stable alternative.
 - Preserve stable bucket IDs, window duration, reset time, and source-slot metadata separately. Never infer quota policy from positional names such as `primary` or `secondary`.
-- Record missing credentials, missing binaries, unknown quota windows, and parse errors as an unavailable state; installed enforcement checkpoints must fail closed until authoritative data returns.
+- Record missing credentials, missing binaries, unknown quota windows, and parse errors as an unavailable state. Preserve any confirmed block, but never reject harness work solely because unlatched telemetry is unavailable.
 - Keep stdout/stderr quiet in hook execution paths.
 - Emit at most one human-readable wait notice through the terminal path when blocking begins.
 - Add a bypass equivalent to `QUOTA_SENTRY_DISABLE=1`.

@@ -64,6 +64,14 @@ def app_server_rate_limits_response(
     }
 
 
+def publish_authoritative_open(path, now):
+    payload = core.codex_app_server_rate_limits_to_usage(
+        app_server_rate_limits_response(primary_used_percent=40,
+                                       secondary_used_percent=40), now=now)
+    decision = core.parse_codex_usage(payload, now=now)
+    core.write_state(path, decision, now=now)
+
+
 class ParseCodexbarUsageTest(unittest.TestCase):
     def test_extract_json_skips_codex_notify_prefix(self):
         payload = core.extract_json(
@@ -569,8 +577,10 @@ class StateTest(unittest.TestCase):
             reset_buffer_seconds=60,
             now=NOW,
         )
+        opened_payload = codexbar_payload(used_percent=12)
+        opened_payload[0]["usage"]["updatedAt"] = core.format_timestamp(NOW + timedelta(minutes=10))
         opened = core.parse_codex_usage(
-            codexbar_payload(used_percent=12),
+            opened_payload,
             threshold_percent=95,
             reset_buffer_seconds=60,
             now=NOW + timedelta(minutes=10),
@@ -936,6 +946,7 @@ class StateTest(unittest.TestCase):
             "status": "blocked",
             "updatedAt": "not-a-date",
             "blockedUntil": "also-not-a-date",
+            "windowMinutes": 300,
         }
         current = {"value": NOW}
         failures = []
@@ -946,7 +957,7 @@ class StateTest(unittest.TestCase):
 
             def sleeper(seconds):
                 current["value"] += timedelta(seconds=seconds)
-                state_path.write_text(json.dumps({"status": "open"}))
+                publish_authoritative_open(state_path, current["value"])
 
             result = core.wait_if_blocked(
                 state_path,
@@ -1017,7 +1028,7 @@ class StateTest(unittest.TestCase):
             def sleeper(seconds):
                 current["value"] = current["value"] + timedelta(seconds=seconds)
                 if current["value"] >= datetime(2026, 6, 1, 16, 31, 1, tzinfo=timezone.utc):
-                    state_path.write_text(json.dumps({"status": "open"}))
+                    publish_authoritative_open(state_path, current["value"])
 
             result = core.wait_if_blocked(
                 state_path,
@@ -1169,13 +1180,14 @@ class StateTest(unittest.TestCase):
             "status": "blocked",
             "updatedAt": "2026-06-01T16:30:00Z",
             "blockedUntil": "2026-06-01T16:31:01Z",
+            "windowMinutes": 300,
         }
         current = {"value": datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc)}
 
         def sleeper(seconds):
             current["value"] = current["value"] + timedelta(seconds=seconds)
             if current["value"] >= datetime(2026, 6, 1, 16, 31, 1, tzinfo=timezone.utc):
-                state_path.write_text(json.dumps({"status": "open"}))
+                publish_authoritative_open(state_path, current["value"])
 
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "state.json"
@@ -1197,6 +1209,7 @@ class StateTest(unittest.TestCase):
             "status": "blocked",
             "updatedAt": "2026-06-01T16:30:00Z",
             "blockedUntil": "2026-06-01T16:31:01Z",
+            "windowMinutes": 300,
         }
         current = {"value": datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc)}
         stdout_messages = []
@@ -1205,7 +1218,7 @@ class StateTest(unittest.TestCase):
         def sleeper(seconds):
             current["value"] = current["value"] + timedelta(seconds=seconds)
             if current["value"] >= datetime(2026, 6, 1, 16, 31, 1, tzinfo=timezone.utc):
-                state_path.write_text(json.dumps({"status": "open"}))
+                publish_authoritative_open(state_path, current["value"])
 
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "state.json"
@@ -1233,6 +1246,7 @@ class StateTest(unittest.TestCase):
             "status": "blocked",
             "updatedAt": "2026-06-01T16:30:00Z",
             "blockedUntil": "2026-06-01T16:31:01Z",
+            "windowMinutes": 300,
         }
         current = {"value": datetime(2026, 6, 1, 16, 30, 0, tzinfo=timezone.utc)}
         messages = []
@@ -1240,7 +1254,7 @@ class StateTest(unittest.TestCase):
         def sleeper(seconds):
             current["value"] = current["value"] + timedelta(seconds=seconds)
             if current["value"] >= datetime(2026, 6, 1, 16, 31, 1, tzinfo=timezone.utc):
-                state_path.write_text(json.dumps({"status": "open"}))
+                publish_authoritative_open(state_path, current["value"])
 
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "state.json"
@@ -1384,19 +1398,17 @@ class HookInstallTest(unittest.TestCase):
         self.assertEqual(
             user_prompt_command,
             "/opt/quota-sentry prompt-guard --read-hook-input "
-            "--require-fresh-state "
-            f"--fail-closed-after-seconds {core.DEFAULT_HOOK_FAIL_CLOSED_AFTER_SECONDS}",
+            "--hook-mode --recover-daemon",
         )
         self.assertEqual(
             pre_tool_command,
             "/opt/quota-sentry guard --state-only --no-notify --read-hook-input "
-            "--require-fresh-state "
-            f"--fail-closed-after-seconds {core.DEFAULT_HOOK_FAIL_CLOSED_AFTER_SECONDS}",
+            "--hook-mode --recover-daemon",
         )
-        self.assertIn("--fail-closed-format block-json", merged["hooks"]["PostToolUse"][-1]["hooks"][0]["command"])
-        self.assertIn("--fail-closed-format stop-json", merged["hooks"]["PreCompact"][-1]["hooks"][0]["command"])
+        self.assertNotIn("--fail-closed", merged["hooks"]["PostToolUse"][-1]["hooks"][0]["command"])
+        self.assertNotIn("--fail-closed", merged["hooks"]["PreCompact"][-1]["hooks"][0]["command"])
 
-    def test_blocking_hooks_outlast_annual_account_window_and_fail_closed_first(self):
+    def test_blocking_hooks_outlast_annual_window_without_normal_denial_watchdog(self):
         merged = core.merge_codex_hooks({}, script_path=Path("/opt/quota-sentry"))
         minimum_account_wait = 365 * 24 * 60 * 60 + core.DEFAULT_RESET_BUFFER_SECONDS
 
@@ -1413,14 +1425,10 @@ class HookInstallTest(unittest.TestCase):
         for event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
             hook = merged["hooks"][event_name][-1]["hooks"][0]
             self.assertEqual(hook["timeout"], core.DEFAULT_HOOK_TIMEOUT_SECONDS)
-            self.assertIs(hook["notifyOnBlock"], True)
-            self.assertEqual(hook["statusMessage"], "QuotaSentry quota checkpoint")
+            self.assertEqual(hook["statusMessage"], "Quota Sentry: quota checkpoint")
             self.assertIn("--read-hook-input", hook["command"])
-            self.assertIn("--require-fresh-state", hook["command"])
-            self.assertIn(
-                f"--fail-closed-after-seconds {core.DEFAULT_HOOK_FAIL_CLOSED_AFTER_SECONDS}",
-                hook["command"],
-            )
+            self.assertIn("--hook-mode", hook["command"])
+            self.assertNotIn("--fail-closed", hook["command"])
 
     def test_installed_hook_commands_do_not_use_shell_composition(self):
         merged = core.merge_codex_hooks({}, script_path=Path("/opt/quota-sentry"))
@@ -1444,9 +1452,7 @@ class HookInstallTest(unittest.TestCase):
         self.assertEqual(
             command,
             "'/Users/example/Open Development/quotaSentry/scripts/quota-sentry' prompt-guard "
-            "--read-hook-input "
-            "--require-fresh-state "
-            f"--fail-closed-after-seconds {core.DEFAULT_HOOK_FAIL_CLOSED_AFTER_SECONDS}",
+            "--read-hook-input --hook-mode --recover-daemon",
         )
         self.assertEqual(command.count("quota-sentry"), 1)
 
@@ -1460,6 +1466,8 @@ class HookInstallTest(unittest.TestCase):
             "PreToolUse": "preToolUse",
             "PostToolUse": "postToolUse",
             "PreCompact": "preCompact",
+            "PreModelRequest": "preModelRequest",
+            "PostModelRequest": "postModelRequest",
         }
         event_keys = {
             "sessionStart": "session_start",
@@ -1467,6 +1475,8 @@ class HookInstallTest(unittest.TestCase):
             "preToolUse": "pre_tool_use",
             "postToolUse": "post_tool_use",
             "preCompact": "pre_compact",
+            "preModelRequest": "pre_model_request",
+            "postModelRequest": "post_model_request",
         }
         metadata = []
         for index, (config_name, event_name) in enumerate(event_names.items()):
@@ -1500,7 +1510,7 @@ class HookInstallTest(unittest.TestCase):
             script_path=script_path,
         )
 
-        self.assertEqual(len(updates), 5)
+        self.assertEqual(len(updates), 7)
         self.assertNotIn(f"{hooks_path}:pre_tool_use:1:0", updates)
         self.assertEqual(
             updates[f"{hooks_path}:user_prompt_submit:0:0"],
@@ -1527,6 +1537,8 @@ class HookInstallTest(unittest.TestCase):
             "PreToolUse": "preToolUse",
             "PostToolUse": "postToolUse",
             "PreCompact": "preCompact",
+            "PreModelRequest": "preModelRequest",
+            "PostModelRequest": "postModelRequest",
         }
         event_keys = {
             "sessionStart": "session_start",
@@ -1534,6 +1546,8 @@ class HookInstallTest(unittest.TestCase):
             "preToolUse": "pre_tool_use",
             "postToolUse": "post_tool_use",
             "preCompact": "pre_compact",
+            "preModelRequest": "pre_model_request",
+            "postModelRequest": "post_model_request",
         }
         metadata = []
         for index, (config_name, event_name) in enumerate(event_names.items()):
@@ -1551,13 +1565,15 @@ class HookInstallTest(unittest.TestCase):
                     "enabled": True,
                     "trustStatus": "trusted",
                     "timeoutSec": hook["timeout"],
+                    "async": hook["async"],
+                    "statusMessage": hook.get("statusMessage"),
                 }
             )
         result = {"data": [{"cwd": "/workspace", "hooks": metadata}]}
 
         self.assertEqual(
             core.verify_quota_sentry_hooks_active(result, hooks_path, script_path),
-            5,
+            7,
         )
 
         metadata[1]["trustStatus"] = "modified"
@@ -1568,6 +1584,14 @@ class HookInstallTest(unittest.TestCase):
         metadata[2]["matcher"] = "NeverMatches"
         with self.assertRaisesRegex(RuntimeError, "unexpected matcher"):
             core.verify_quota_sentry_hooks_active(result, hooks_path, script_path)
+        metadata[2]["matcher"] = ".*"
+        metadata[-1]["async"] = True
+        with self.assertRaisesRegex(RuntimeError, "asynchronous"):
+            core.verify_quota_sentry_hooks_active(result, hooks_path, script_path)
+        metadata[-1]["async"] = False
+        metadata[-1]["statusMessage"] = "unrelated status"
+        with self.assertRaisesRegex(RuntimeError, "unexpected status"):
+            core.verify_quota_sentry_hooks_active(result, hooks_path, script_path)
 
     def test_global_hook_install_persists_codex_trust(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1575,7 +1599,7 @@ class HookInstallTest(unittest.TestCase):
             hooks_path = home / ".codex" / "hooks.json"
             script_path = Path("/opt/quota-sentry")
             with mock.patch.object(Path, "home", return_value=home), mock.patch.object(
-                core, "trust_codex_hooks", return_value=5
+                core, "trust_codex_hooks", return_value=7
             ) as trust:
                 args = cli.build_parser().parse_args(
                     ["install-hook", "--script-path", str(script_path)]
@@ -1587,6 +1611,7 @@ class HookInstallTest(unittest.TestCase):
             hooks_path.resolve(),
             script_path.resolve(),
             cwd=Path.cwd(),
+            notify_on_block=True,
         )
 
     def test_global_hook_install_fails_when_codex_trust_cannot_be_persisted(self):
@@ -2649,7 +2674,7 @@ class AutonomousHarnessTest(unittest.TestCase):
         self.assertIn("AT-013 weekly-only default hard-block", result.stdout)
         self.assertIn("AT-014 auxiliary bucket remains advisory", result.stdout)
         self.assertIn("AT-015 weekly prompt guard waits for authoritative reset", result.stdout)
-        self.assertIn("AT-016 hook safety deadline fails closed", result.stdout)
+        self.assertIn("AT-016 legacy manual watchdog compatibility", result.stdout)
         self.assertIn("AT-017 confirmed block survives source failure", result.stdout)
         self.assertIn("AT-018 valid block wins over malformed sibling", result.stdout)
         self.assertIn("AT-019 backend exhaustion without windows blocks", result.stdout)

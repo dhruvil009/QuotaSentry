@@ -233,9 +233,75 @@ def request_refresh_if_needed(
     return True
 
 
+def request_daemon_recovery(args: argparse.Namespace) -> None:
+    state_dir = resolve_state_dir(args.state_dir)
+    core.request_refresh(core.default_refresh_request_path(state_dir))
+    if not getattr(args, "recover_daemon", False) or core.fcntl is None:
+        return
+    command = [str(script_path()), "start", "--quiet", "--state-dir", str(state_dir),
+               "--threshold-percent", str(args.threshold_percent),
+               "--reset-buffer-seconds", str(args.reset_buffer_seconds),
+               "--source", args.source]
+    if args.config_path:
+        command.extend(["--config-path", str(resolve_config_path(args.config_path))])
+    startup = build_parser().parse_args(command[1:])
+    pid = read_pid(core.default_pid_path(state_dir))
+    if pid and is_quota_sentry_daemon(pid, state_dir, expected_args=startup,
+                                     expected_runtime_fingerprint=runtime_fingerprint()):
+        return
+    handle = try_acquire_daemon_lock(state_dir / "recovery.lock")
+    if handle is None:
+        return
+    try:
+        handle.seek(0)
+        try:
+            previous = float(handle.read().decode("ascii"))
+        except (ValueError, UnicodeError):
+            previous = 0.0
+        current = time.time()
+        if 0 <= current - previous < core.DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS:
+            return
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(current).encode("ascii"))
+        handle.flush()
+        os.fsync(handle.fileno())
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True,
+                         close_fds=True, pass_fds=(handle.fileno(),))
+    finally:
+        # The bootstrap inherits the same flock until its own exit.
+        handle.close()
+
+
+def hook_policy_config(args: argparse.Namespace) -> Optional[core.QuotaConfig]:
+    return core.read_valid_config(resolve_config_path(args.config_path))
+
+
+def hook_guard_command(args: argparse.Namespace) -> int:
+    state_dir = resolve_state_dir(args.state_dir)
+
+    def bypass():
+        config = hook_policy_config(args)
+        return bool(config and core.is_cwd_exempt(Path.cwd(), config.exempt_cwds))
+
+    return core.wait_if_blocked(
+        core.default_state_path(state_dir),
+        poller=lambda: None, state_only=True, notify=False, verbose=False,
+        now_func=core.utc_now,
+        max_state_age_seconds=args.max_state_age_seconds,
+        poll_interval_seconds=args.interval_seconds,
+        recovery=lambda: request_daemon_recovery(args),
+        bypass=bypass, policy_config=lambda: hook_policy_config(args),
+        threshold_percent=args.threshold_percent,
+    )
+
+
 def is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+        return True
+    except PermissionError:
         return True
     except OSError:
         return False
@@ -668,6 +734,8 @@ def status_command(args: argparse.Namespace) -> int:
 
 def guard_command(args: argparse.Namespace) -> int:
     consume_hook_input(args)
+    if getattr(args, "hook_mode", False):
+        return hook_guard_command(args)
     if (
         os.environ.get("QUOTA_SENTRY_DISABLE") == "1"
         or _current_cwd_is_exempt(args)
@@ -721,6 +789,8 @@ def guard_command(args: argparse.Namespace) -> int:
 
 def prompt_guard_command(args: argparse.Namespace) -> int:
     consume_hook_input(args)
+    if getattr(args, "hook_mode", False):
+        return hook_guard_command(args)
     if (
         os.environ.get("QUOTA_SENTRY_DISABLE") == "1"
         or _current_cwd_is_exempt(args)
@@ -784,7 +854,8 @@ def install_hook_command(args: argparse.Namespace) -> int:
             if args.script_path
             else script_path()
         )
-        merged = core.merge_codex_hooks(existing, selected_script_path)
+        notify_on_block = core.read_config(resolve_config_path(args.config_path)).notify_on_block
+        merged = core.merge_codex_hooks(existing, selected_script_path, notify_on_block=notify_on_block)
         if merged != existing:
             if hooks_path.exists() and hooks_path.read_text().strip():
                 core.write_json_atomic(backup_path, existing)
@@ -795,6 +866,7 @@ def install_hook_command(args: argparse.Namespace) -> int:
                 hooks_path,
                 selected_script_path,
                 cwd=Path.cwd(),
+                notify_on_block=notify_on_block,
             )
             print(f"Quota Sentry: trusted and enabled {trusted_count} Codex hooks")
     except Exception as exc:
@@ -847,6 +919,7 @@ def configure_command(args: argparse.Namespace) -> int:
         weekly_mode=weekly_mode,
         weekly_threshold_percent=weekly_threshold_percent,
         exempt_cwds=current.exempt_cwds,
+        notify_on_block=current.notify_on_block,
     )
     core.write_config(config_path, config)
     print(
@@ -878,6 +951,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--reset-buffer-seconds", type=int, default=core.DEFAULT_RESET_BUFFER_SECONDS)
     common.add_argument("--read-hook-input", action="store_true", help=argparse.SUPPRESS)
     common.add_argument("--require-fresh-state", action="store_true", help=argparse.SUPPRESS)
+    common.add_argument("--hook-mode", action="store_true", help=argparse.SUPPRESS)
+    common.add_argument("--recover-daemon", action="store_true", help=argparse.SUPPRESS)
     common.add_argument(
         "--source",
         choices=[core.AUTO_SOURCE, core.CODEX_APP_SERVER_SOURCE, core.CODEXBAR_SOURCE],
@@ -1015,7 +1090,7 @@ def main(argv: Optional[list] = None) -> int:
     try:
         return args.func(args)
     except Exception:
-        if args.command in {"guard", "prompt-guard"} and getattr(
+        if not args.hook_mode and args.command in {"guard", "prompt-guard"} and getattr(
             args, "require_fresh_state", False
         ):
             return fail_closed_hook_result(args, core.HOOK_INTERNAL_FAILURE_MESSAGE)

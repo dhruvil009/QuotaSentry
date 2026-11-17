@@ -18,6 +18,15 @@ QUOTA_SENTRY = ROOT / "scripts" / "quota-sentry"
 DEFAULT_RUN_ROOT = ROOT / ".quota-sentry-runs"
 EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS = 366 * 24 * 60 * 60
 EXPECTED_HOOK_WATCHDOG_SECONDS = EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS - 10 * 60
+HOOK_WIRE_EVENTS = {
+    "SessionStart": "sessionStart",
+    "UserPromptSubmit": "userPromptSubmit",
+    "PreToolUse": "preToolUse",
+    "PostToolUse": "postToolUse",
+    "PreCompact": "preCompact",
+    "PreModelRequest": "preModelRequest",
+    "PostModelRequest": "postModelRequest",
+}
 
 
 SCENARIOS = [
@@ -36,7 +45,7 @@ SCENARIOS = [
     ("AT-013", "weekly-only default hard-block"),
     ("AT-014", "auxiliary bucket remains advisory"),
     ("AT-015", "weekly prompt guard waits for authoritative reset"),
-    ("AT-016", "hook safety deadline fails closed"),
+    ("AT-016", "legacy manual watchdog compatibility"),
     ("AT-017", "confirmed block survives source failure"),
     ("AT-018", "valid block wins over malformed sibling"),
     ("AT-019", "backend exhaustion without windows blocks"),
@@ -341,6 +350,21 @@ print(json.dumps(payload))
         if not state_path.exists():
             raise AutonomousTestError(f"state file was not created: {state_path}")
         return json.loads(state_path.read_text())
+
+    def wait_for_new_source_second(self, state: Dict[str, object]) -> None:
+        # The adapter serializes observation times to whole seconds.
+        windows = state.get("enforcement", {}).get("windows", [])
+        timestamps = [window.get("sourceObservedAt") for window in windows]
+        timestamps.append(state.get("sourceObservedAt"))
+        observed = [datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                    for value in timestamps if isinstance(value, str)]
+        if not observed:
+            raise AutonomousTestError("release fixture has no source observation timestamp")
+        remaining = max(observed) + 1 - time.time()
+        if remaining > 1.1:
+            raise AutonomousTestError("source observation is unexpectedly in the future")
+        if remaining > 0:
+            time.sleep(remaining + 0.01)
 
     def wait_for_state(self, state_dir: Path, timeout_seconds: int = 6) -> Dict[str, object]:
         deadline = time.monotonic() + timeout_seconds
@@ -726,12 +750,14 @@ print(json.dumps(payload))
         serialized = json.dumps(merged)
         if "echo existing" not in serialized:
             raise AutonomousTestError("existing hook was not preserved")
-        for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
+        for event_name in HOOK_WIRE_EVENTS:
             if event_name not in merged.get("hooks", {}):
                 raise AutonomousTestError(f"missing hook event after merge: {event_name}")
             event_hook = merged["hooks"][event_name][-1]["hooks"][0]
             if event_hook.get("async") is not False:
-                raise AutonomousTestError(f"{event_name} hook must be synchronous for Codex 0.140 compatibility")
+                raise AutonomousTestError(f"{event_name} hook must be synchronous")
+            if event_name != "SessionStart" and event_hook.get("statusMessage") != "Quota Sentry: quota checkpoint":
+                raise AutonomousTestError(f"{event_name} hook has an unexpected native status label")
         if merged["hooks"]["SessionStart"][-1].get("matcher") != "startup|resume|clear|compact":
             raise AutonomousTestError("SessionStart hook does not cover resumed sessions")
         user_prompt_command = merged["hooks"]["UserPromptSubmit"][-1]["hooks"][0]["command"]
@@ -747,27 +773,22 @@ print(json.dumps(payload))
             raise AutonomousTestError(f"UserPromptSubmit hook invokes quota-sentry more than once: {user_prompt_command}")
         if "guard --state-only --no-notify" not in pre_tool_command:
             raise AutonomousTestError(f"PreToolUse hook is not cache-only: {pre_tool_command}")
-        for event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
+        for event_name in HOOK_WIRE_EVENTS:
+            if event_name == "SessionStart":
+                continue
             event_hook = merged["hooks"][event_name][-1]["hooks"][0]
             if event_hook.get("timeout") != EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS:
                 raise AutonomousTestError(
                     f"{event_name} hook has unsafe timeout: {event_hook.get('timeout')!r}"
                 )
-            if (
-                f"--fail-closed-after-seconds {EXPECTED_HOOK_WATCHDOG_SECONDS}"
-                not in event_hook.get("command", "")
-            ):
-                raise AutonomousTestError(f"{event_name} hook is missing its fail-closed watchdog")
-            if "--read-hook-input" not in event_hook.get("command", ""):
-                raise AutonomousTestError(f"{event_name} hook does not consume Codex hook stdin")
-            if "--require-fresh-state" not in event_hook.get("command", ""):
-                raise AutonomousTestError(f"{event_name} hook is missing guard compatibility mode")
-        post_tool_command = merged["hooks"]["PostToolUse"][-1]["hooks"][0].get("command", "")
-        if "--fail-closed-format block-json" not in post_tool_command:
-            raise AutonomousTestError("PostToolUse hook does not block its result on watchdog")
-        pre_compact_command = merged["hooks"]["PreCompact"][-1]["hooks"][0].get("command", "")
-        if "--fail-closed-format stop-json" not in pre_compact_command:
-            raise AutonomousTestError("PreCompact hook does not stop compaction on watchdog")
+            command = event_hook.get("command", "")
+            for flag in ("--read-hook-input", "--hook-mode", "--recover-daemon"):
+                if flag not in command:
+                    raise AutonomousTestError(f"{event_name} hook is missing {flag}")
+            if "--fail-closed" in command or "--require-fresh-state" in command:
+                raise AutonomousTestError(f"{event_name} hook still selects a legacy denial watchdog")
+            if event_name != "UserPromptSubmit" and "guard --state-only --no-notify" not in command:
+                raise AutonomousTestError(f"{event_name} hook is not cache-only")
         if not hooks_path.with_suffix(".json.bak").exists():
             raise AutonomousTestError("expected hook backup was not written")
         result.notes.append("Temp hook install preserved existing hooks and wrote a backup.")
@@ -790,12 +811,12 @@ print(json.dumps(payload))
                 result.notes.append(f"Global hooks do not reference this checkout: {expected}")
                 return
             raise AutonomousTestError(f"global hooks do not reference {expected}")
-        for event_name in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
+        for event_name in HOOK_WIRE_EVENTS:
             if event_name not in payload.get("hooks", {}):
                 raise AutonomousTestError(f"global hooks missing {event_name}")
             event_hook = payload["hooks"][event_name][-1]["hooks"][0]
             if event_hook.get("async") is not False:
-                raise AutonomousTestError(f"global {event_name} hook must be synchronous for Codex 0.140 compatibility")
+                raise AutonomousTestError(f"global {event_name} hook must be synchronous")
         user_prompt_serialized = json.dumps(payload["hooks"]["UserPromptSubmit"])
         pre_tool_serialized = json.dumps(payload["hooks"]["PreToolUse"])
         if "prompt-guard" not in user_prompt_serialized:
@@ -809,31 +830,22 @@ print(json.dumps(payload))
             raise AutonomousTestError("global UserPromptSubmit hook invokes quota-sentry more than once")
         if "guard --state-only --no-notify" not in pre_tool_serialized:
             raise AutonomousTestError("global PreToolUse hook is not cache-only")
-        for event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"):
+        for event_name in HOOK_WIRE_EVENTS:
+            if event_name == "SessionStart":
+                continue
             event_hook = payload["hooks"][event_name][-1]["hooks"][0]
             if event_hook.get("timeout") != EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS:
                 raise AutonomousTestError(
                     f"global {event_name} hook has unsafe timeout: {event_hook.get('timeout')!r}"
                 )
-            if (
-                f"--fail-closed-after-seconds {EXPECTED_HOOK_WATCHDOG_SECONDS}"
-                not in event_hook.get("command", "")
-            ):
-                raise AutonomousTestError(
-                    f"global {event_name} hook is missing its fail-closed watchdog"
-                )
-            if "--read-hook-input" not in event_hook.get("command", ""):
-                raise AutonomousTestError(f"global {event_name} hook does not consume hook stdin")
-            if "--require-fresh-state" not in event_hook.get("command", ""):
-                raise AutonomousTestError(
-                    f"global {event_name} hook is missing guard compatibility mode"
-                )
-        post_tool_command = payload["hooks"]["PostToolUse"][-1]["hooks"][0].get("command", "")
-        if "--fail-closed-format block-json" not in post_tool_command:
-            raise AutonomousTestError("global PostToolUse hook does not block its result on watchdog")
-        pre_compact_command = payload["hooks"]["PreCompact"][-1]["hooks"][0].get("command", "")
-        if "--fail-closed-format stop-json" not in pre_compact_command:
-            raise AutonomousTestError("global PreCompact hook does not stop compaction on watchdog")
+            command = event_hook.get("command", "")
+            for flag in ("--read-hook-input", "--hook-mode", "--recover-daemon"):
+                if flag not in command:
+                    raise AutonomousTestError(f"global {event_name} hook is missing {flag}")
+            if "--fail-closed" in command or "--require-fresh-state" in command:
+                raise AutonomousTestError(f"global {event_name} hook still selects a legacy denial watchdog")
+            if event_name != "UserPromptSubmit" and "guard --state-only --no-notify" not in command:
+                raise AutonomousTestError(f"global {event_name} hook is not cache-only")
 
         catalog = self.codex_hooks_list(result)
         catalog_entries = catalog.get("data")
@@ -855,14 +867,7 @@ print(json.dumps(payload))
         if not isinstance(metadata, list):
             raise AutonomousTestError("Codex hooks/list returned no hook metadata")
 
-        wire_events = {
-            "SessionStart": "sessionStart",
-            "UserPromptSubmit": "userPromptSubmit",
-            "PreToolUse": "preToolUse",
-            "PostToolUse": "postToolUse",
-            "PreCompact": "preCompact",
-        }
-        for config_event, wire_event in wire_events.items():
+        for config_event, wire_event in HOOK_WIRE_EVENTS.items():
             expected_hook = payload["hooks"][config_event][-1]["hooks"][0]
             matches = [
                 hook
@@ -888,8 +893,12 @@ print(json.dumps(payload))
                 raise AutonomousTestError(
                     f"Codex {config_event} timeout differs from hooks.json"
                 )
+            if discovered.get("async", False) is not False:
+                raise AutonomousTestError(f"Codex {config_event} hook is asynchronous")
+            if discovered.get("statusMessage") != expected_hook.get("statusMessage"):
+                raise AutonomousTestError(f"Codex {config_event} native status differs from hooks.json")
         result.notes.append(
-            "Codex hooks/list verified five exact, enabled, trusted hooks from this checkout."
+            "Codex hooks/list verified seven exact, enabled, trusted synchronous hooks from this checkout."
         )
 
     def scenario_codexbar_failure_fails_open(self, result: ScenarioResult) -> None:
@@ -1231,7 +1240,7 @@ print(json.dumps(payload))
                 f"fail-closed hook returned the wrong blocking reason: {guard_result.stderr!r}"
             )
         result.notes.append(
-            "A compressed weekly wait reached Quota Sentry's watchdog and returned Codex's blocking exit code 2."
+            "The explicitly requested legacy manual watchdog returned exit code 2; candidate hooks never select it."
         )
 
     def scenario_confirmed_block_survives_source_failure(self, result: ScenarioResult) -> None:
@@ -1251,6 +1260,7 @@ print(json.dumps(payload))
             raise AutonomousTestError(
                 f"source failure cleared a confirmed weekly block: {failed_state}"
             )
+        self.wait_for_new_source_second(failed_state)
         self.run(
             result,
             [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
@@ -1365,6 +1375,7 @@ print(json.dumps(payload))
             raise AutonomousTestError(
                 f"omitted backend state cleared a confirmed account latch: {omitted_state}"
             )
+        self.wait_for_new_source_second(omitted_state)
         self.run(
             result,
             [str(QUOTA_SENTRY), "poll", "--state-dir", str(state_dir)],
@@ -1514,7 +1525,7 @@ print(json.dumps(payload))
         )
         self.run_scenario(
             "AT-016",
-            "hook safety deadline fails closed",
+            "legacy manual watchdog compatibility",
             self.scenario_hook_safety_deadline_fails_closed,
         )
         self.run_scenario(

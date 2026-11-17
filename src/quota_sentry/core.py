@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -8,7 +9,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -75,6 +76,7 @@ class QuotaConfig:
     weekly_mode: str = DEFAULT_WEEKLY_MODE
     weekly_threshold_percent: int = DEFAULT_WEEKLY_THRESHOLD_PERCENT
     exempt_cwds: Tuple[str, ...] = ()
+    notify_on_block: bool = True
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,7 @@ class QuotaDecision:
     rate_limit_state_known: bool = False
     spend_control_reached: Optional[bool] = None
     rate_limit_reached_type: Optional[str] = None
+    source_context: Optional[str] = None
 
     @property
     def primary_window(self) -> Optional[QuotaWindow]:
@@ -127,16 +130,16 @@ def utc_now() -> datetime:
 
 
 def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+    if not isinstance(value, str) or not value:
         return None
     normalized = value.replace("Z", "+00:00")
     try:
         parsed = datetime.fromisoformat(normalized)
-    except ValueError:
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def format_timestamp(value: Optional[datetime]) -> Optional[str]:
@@ -261,9 +264,11 @@ def _valid_weekly_mode(value: Any) -> str:
 
 
 def _valid_percent(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
     try:
         percent = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     if percent < 1 or percent > 100:
         return default
@@ -320,6 +325,7 @@ def config_from_payload(payload: Any) -> QuotaConfig:
             DEFAULT_WEEKLY_THRESHOLD_PERCENT,
         ),
         exempt_cwds=_valid_exempt_cwds(payload.get("exemptCwds")),
+        notify_on_block=payload.get("notifyOnBlock") is not False,
     )
 
 
@@ -334,15 +340,29 @@ def config_to_payload(config: QuotaConfig) -> Dict[str, Any]:
     exempt_cwds = _valid_exempt_cwds(list(config.exempt_cwds))
     if exempt_cwds:
         payload["exemptCwds"] = list(exempt_cwds)
+    if config.notify_on_block is False:
+        payload["notifyOnBlock"] = False
     return payload
 
 
 def read_config(path: Optional[Path] = None) -> QuotaConfig:
+    return read_valid_config(path) or QuotaConfig()
+
+
+def read_valid_config(path: Optional[Path] = None) -> Optional[QuotaConfig]:
     config_path = path or default_config_path()
     try:
-        return config_from_payload(json.loads(config_path.read_text()))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return QuotaConfig()
+        payload = json.loads(config_path.read_text())
+        if not isinstance(payload, dict):
+            return None
+        if "weeklyMode" in payload and not _is_valid_weekly_mode(payload["weeklyMode"]):
+            return None
+        threshold = payload.get("weeklyThresholdPercent", DEFAULT_WEEKLY_THRESHOLD_PERCENT)
+        if isinstance(threshold, bool) or not isinstance(threshold, int) or not 1 <= threshold <= 100:
+            return None
+        return config_from_payload(payload)
+    except (UnicodeError, ValueError, RecursionError, OSError):
+        return None
 
 
 def write_config(path: Path, config: QuotaConfig) -> None:
@@ -408,7 +428,7 @@ def _window_minutes(value: Any) -> Optional[int]:
         return None
     try:
         minutes = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if isinstance(value, float) and not value.is_integer():
         return None
@@ -434,7 +454,7 @@ def _percent(value: Any) -> Optional[Percent]:
         return None
     try:
         percent = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(percent) or percent < 0 or percent > 100:
         return None
@@ -531,8 +551,6 @@ def _backend_limit_state(
 
     spend_value = usage.get("spendControlReached")
     spend_control_reached = spend_value if isinstance(spend_value, bool) else None
-    if reached_type is None and spend_control_reached is True:
-        reached_type = "spend_control_reached"
     account_state_known = rate_state_known or spend_control_reached is not None
     return (
         account_state_known,
@@ -608,6 +626,7 @@ def _blocked_decision(
     rate_limit_state_known: bool = False,
     spend_control_reached: Optional[bool] = None,
     rate_limit_reached_type: Optional[str] = None,
+    source_context: Optional[str] = None,
 ) -> QuotaDecision:
     blocked_until = window.resets_at + timedelta(seconds=reset_buffer_seconds)
     return QuotaDecision(
@@ -628,6 +647,7 @@ def _blocked_decision(
         uncertain_blocking_kinds=tuple(uncertain_blocking_kinds),
         source=source,
         source_observed_at=source_observed_at,
+        source_context=source_context,
         canonical_limit_id=canonical_limit_id,
         account_limit_state_known=account_limit_state_known,
         rate_limit_state_known=rate_limit_state_known,
@@ -685,6 +705,7 @@ def parse_codex_usage(
     ) = _backend_limit_state(usage)
     decision_context = {
         "source": source,
+        "source_context": _optional_string(entry.get("sourceContext")),
         "source_observed_at": source_observed_at,
         "canonical_limit_id": canonical_limit_id,
         "account_limit_state_known": account_limit_state_known,
@@ -716,7 +737,8 @@ def parse_codex_usage(
     short_term_window = _preferred_window(short_term_windows)
     weekly_window = _preferred_window(weekly_windows)
 
-    if rate_limit_reached_type is not None:
+    account_windows = []
+    if rate_limit_reached_type is not None or spend_control_reached is True:
         future_resets = [
             window.resets_at
             for window in default_windows
@@ -727,39 +749,16 @@ def parse_codex_usage(
             if future_resets
             else current_time + timedelta(seconds=DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS)
         )
-        account_window = QuotaWindow(
-            name=WINDOW_KIND_ACCOUNT,
-            used_percent=100,
-            window_minutes=None,
-            resets_at=account_reset,
-            kind=WINDOW_KIND_ACCOUNT,
-            limit_id=canonical_limit_id,
-            source_slot=None,
-            is_default_limit=True,
-            rate_limit_reached_type=rate_limit_reached_type,
-        )
-        return _blocked_decision(
-            account_window,
-            reset_buffer_seconds=reset_buffer_seconds,
-            blocked_window=WINDOW_KIND_ACCOUNT,
-            short_term_window=short_term_window,
-            weekly_window=weekly_window,
-            quota_windows=(*quota_windows, account_window),
-            weekly_hard_block_enabled=weekly_hard_block_enabled,
-            blocked_quota_windows=(account_window,),
-            uncertain_blocking_kinds=uncertain_blocking_kinds,
-            **decision_context,
-        )
-
-    if not quota_windows:
-        reason = window_errors[0][2] if window_errors else "quota source returned no quota window"
-        return QuotaDecision(
-            status="unknown",
-            reason=reason,
-            weekly_hard_block_enabled=weekly_hard_block_enabled,
-            uncertain_blocking_kinds=uncertain_blocking_kinds,
-            **decision_context,
-        )
+        reasons = []
+        if rate_limit_reached_type is not None:
+            reasons.append(rate_limit_reached_type)
+        if spend_control_reached is True:
+            reasons.append("spend_control_reached")
+        account_windows = [QuotaWindow(
+            name=WINDOW_KIND_ACCOUNT, used_percent=100, window_minutes=None,
+            resets_at=account_reset, kind=WINDOW_KIND_ACCOUNT,
+            limit_id=canonical_limit_id, rate_limit_reached_type=reason,
+        ) for reason in reasons]
 
     blocked_candidates: List[Tuple[str, QuotaWindow]] = []
     threshold_reached_windows: List[QuotaWindow] = []
@@ -782,6 +781,7 @@ def parse_codex_usage(
             threshold_reached_windows.append(window)
             if window.resets_at > current_time:
                 blocked_candidates.append((window.kind, window))
+    blocked_candidates.extend((WINDOW_KIND_ACCOUNT, window) for window in account_windows)
 
     if blocked_candidates:
         blocked_window, blocked_quota_window = max(
@@ -794,9 +794,18 @@ def parse_codex_usage(
             blocked_window=blocked_window,
             short_term_window=short_term_window,
             weekly_window=weekly_window,
-            quota_windows=quota_windows,
+            quota_windows=(*quota_windows, *account_windows),
             weekly_hard_block_enabled=weekly_hard_block_enabled,
             blocked_quota_windows=(window for _kind, window in blocked_candidates),
+            uncertain_blocking_kinds=uncertain_blocking_kinds,
+            **decision_context,
+        )
+
+    if not quota_windows:
+        reason = window_errors[0][2] if window_errors else "quota source returned no quota window"
+        return QuotaDecision(
+            status="unknown", reason=reason,
+            weekly_hard_block_enabled=weekly_hard_block_enabled,
             uncertain_blocking_kinds=uncertain_blocking_kinds,
             **decision_context,
         )
@@ -929,6 +938,8 @@ def _blocked_latch_from_window(
     confirmed_at: datetime,
     source: Optional[str],
     source_observed_at: Optional[datetime],
+    source_context: Optional[str] = None,
+    threshold_percent: int = 100,
     previous: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     previous_confirmed_at = previous.get("confirmedAt") if isinstance(previous, dict) else None
@@ -944,7 +955,9 @@ def _blocked_latch_from_window(
         "lastConfirmedAt": format_timestamp(confirmed_at),
         "source": source,
         "sourceObservedAt": format_timestamp(source_observed_at),
+        "sourceContext": source_context,
         "rateLimitReachedType": window.rate_limit_reached_type,
+        "thresholdPercent": threshold_percent,
     }
 
 
@@ -970,6 +983,9 @@ def _observation_can_supersede_latch(
     decision: QuotaDecision,
     candidates: Iterable[QuotaWindow],
 ) -> bool:
+    previous_context = _optional_string(previous.get("sourceContext"))
+    if previous_context is not None and decision.source_context != previous_context:
+        return False
     previous_source = _optional_string(previous.get("source"))
     current_source = decision.source
     previous_authority = _source_authority(previous_source)
@@ -983,7 +999,7 @@ def _observation_can_supersede_latch(
     previous_observed_at = parse_timestamp(previous.get("sourceObservedAt"))
     if previous_observed_at is not None and (
         decision.source_observed_at is None
-        or decision.source_observed_at < previous_observed_at
+        or decision.source_observed_at <= previous_observed_at
     ):
         return False
 
@@ -998,22 +1014,20 @@ def _observation_can_supersede_latch(
 
 def _previous_enforcement_windows(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     enforcement = state.get("enforcement")
-    if isinstance(enforcement, dict) and enforcement.get("status") == "blocked":
+    enforcement_blocked = isinstance(enforcement, dict) and enforcement.get("status") == "blocked"
+    if enforcement_blocked:
         windows = enforcement.get("windows")
         if isinstance(windows, list):
-            return [
+            retained = [
                 dict(window)
                 for window in windows
                 if isinstance(window, dict)
-                and isinstance(window.get("kind"), str)
-                and parse_timestamp(window.get("blockedUntil")) is not None
+                and _optional_string(window.get("kind")) is not None
             ]
+            if retained:
+                return retained
 
-    if state.get("status") != "blocked":
-        return []
-    updated_at = parse_timestamp(state.get("updatedAt"))
-    blocked_until = parse_timestamp(state.get("blockedUntil"))
-    if updated_at is None or blocked_until is None:
+    if state.get("status") != "blocked" and not enforcement_blocked:
         return []
     kind = state.get("blockedWindow")
     if not isinstance(kind, str):
@@ -1031,9 +1045,40 @@ def _previous_enforcement_windows(state: Dict[str, Any]) -> List[Dict[str, Any]]
             "lastConfirmedAt": state.get("updatedAt"),
             "source": state.get("source"),
             "sourceObservedAt": state.get("sourceObservedAt"),
+            "sourceContext": state.get("sourceContext"),
             "rateLimitReachedType": state.get("rateLimitReachedType"),
         }
     ]
+
+
+def _latch_identity(window: Dict[str, Any]) -> Tuple[Any, ...]:
+    kind = _optional_string(window.get("kind"))
+    condition = None
+    if kind == WINDOW_KIND_ACCOUNT:
+        condition = ("spend" if window.get("rateLimitReachedType") == "spend_control_reached"
+                     else "rate")
+    return (kind, _optional_string(window.get("limitId")),
+            _window_minutes(window.get("windowMinutes")),
+            _optional_string(window.get("sourceContext")), condition)
+
+
+def _retained_policy_config(
+    state: Dict[str, Any], windows: Iterable[Dict[str, Any]] = (),
+) -> QuotaConfig:
+    snapshot = state.get("observation")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    retained = [*_previous_enforcement_windows(state), *windows]
+    thresholds = [window.get("thresholdPercent") for window in retained
+                  if window.get("kind") == WINDOW_KIND_WEEKLY]
+    thresholds.append(snapshot.get("weeklyThresholdPercent"))
+    valid_thresholds = [value for value in thresholds
+                        if type(value) is int and 1 <= value <= 100]
+    weekly_blocked = any(window.get("kind") == WINDOW_KIND_WEEKLY for window in retained)
+    mode = (WEEKLY_MODE_ADVISORY if snapshot.get("weeklyHardBlockEnabled") is False
+            and not weekly_blocked else WEEKLY_MODE_HARD_BLOCK)
+    return QuotaConfig(weekly_mode=mode,
+                       weekly_threshold_percent=min(valid_thresholds)
+                       if valid_thresholds else DEFAULT_WEEKLY_THRESHOLD_PERCENT)
 
 
 def _merged_enforcement_windows(
@@ -1044,9 +1089,8 @@ def _merged_enforcement_windows(
     threshold_percent: int,
     weekly_threshold_percent: int,
 ) -> List[Dict[str, Any]]:
-    active = {
-        window["kind"]: window for window in _previous_enforcement_windows(previous_state)
-    }
+    active = {_latch_identity(window): window
+              for window in _previous_enforcement_windows(previous_state)}
     uncertain_kinds = set(decision.uncertain_blocking_kinds)
     observations: Dict[str, List[QuotaWindow]] = {
         WINDOW_KIND_SHORT_TERM: [],
@@ -1059,45 +1103,32 @@ def _merged_enforcement_windows(
         if window.is_default_limit and window.kind in observations:
             observations[window.kind].append(window)
 
-    for kind, threshold in (
-        (WINDOW_KIND_SHORT_TERM, threshold_percent),
-        (WINDOW_KIND_WEEKLY, weekly_threshold_percent),
-        (WINDOW_KIND_ACCOUNT, 100),
-        (WINDOW_KIND_LONG_TERM, 100),
-        (WINDOW_KIND_UNKNOWN, 100),
-    ):
+    thresholds = {WINDOW_KIND_SHORT_TERM: threshold_percent,
+                  WINDOW_KIND_WEEKLY: weekly_threshold_percent}
+    for key, previous in list(active.items()):
+        kind = previous["kind"]
+        threshold = thresholds.get(kind, 100)
         if kind == WINDOW_KIND_WEEKLY and not decision.weekly_hard_block_enabled:
-            active.pop(kind, None)
+            active.pop(key, None)
             continue
         if kind == WINDOW_KIND_ACCOUNT:
-            previous = active.get(kind)
-            previous_reached_type = (
-                _optional_string(previous.get("rateLimitReachedType"))
-                if previous is not None
-                else None
-            )
             explicitly_cleared = (
                 decision.spend_control_reached is False
-                if previous_reached_type == "spend_control_reached"
-                else decision.rate_limit_state_known
+                if previous.get("rateLimitReachedType") == "spend_control_reached"
+                else decision.rate_limit_state_known and decision.rate_limit_reached_type is None
             )
-            if (
-                previous is not None
-                and decision.account_limit_state_known
-                and decision.rate_limit_reached_type is None
-                and explicitly_cleared
-                and _observation_can_supersede_latch(previous, decision, ())
-            ):
-                active.pop(kind, None)
+            if explicitly_cleared and _observation_can_supersede_latch(previous, decision, ()):
+                active.pop(key, None)
             continue
-        candidates = observations[kind]
+        duration = _window_minutes(previous.get("windowMinutes"))
+        limit_id = _optional_string(previous.get("limitId"))
+        candidates = [window for window in observations.get(kind, ())
+                      if window.window_minutes == duration
+                      and (limit_id is None or window.limit_id == limit_id)]
         if kind not in uncertain_kinds and candidates and all(
             window.used_percent < threshold for window in candidates
-        ) and (
-            kind not in active
-            or _observation_can_supersede_latch(active[kind], decision, candidates)
-        ):
-            active.pop(kind, None)
+        ) and _observation_can_supersede_latch(previous, decision, candidates):
+            active.pop(key, None)
 
     reset_buffer_seconds = 0.0
     if decision.resets_at is not None and decision.blocked_until is not None:
@@ -1107,7 +1138,11 @@ def _merged_enforcement_windows(
         )
     for window in decision.blocked_quota_windows:
         blocked_until = window.resets_at + timedelta(seconds=reset_buffer_seconds)
-        previous = active.get(window.kind)
+        key = _latch_identity({"kind": window.kind, "limitId": window.limit_id,
+                               "windowMinutes": window.window_minutes,
+                               "sourceContext": decision.source_context,
+                               "rateLimitReachedType": window.rate_limit_reached_type})
+        previous = active.get(key)
         if previous is not None and not _observation_can_supersede_latch(
             previous,
             decision,
@@ -1120,15 +1155,16 @@ def _merged_enforcement_windows(
             confirmed_at=current_time,
             source=decision.source,
             source_observed_at=decision.source_observed_at,
+            source_context=decision.source_context,
+            threshold_percent=thresholds.get(window.kind, 100),
             previous=previous,
         )
         existing_until = parse_timestamp(previous.get("blockedUntil")) if previous else None
-        if existing_until is None or blocked_until >= existing_until:
-            active[window.kind] = candidate
-        else:
-            previous["lastConfirmedAt"] = format_timestamp(current_time)
+        if existing_until is not None and blocked_until < existing_until:
+            candidate["blockedUntil"] = format_timestamp(existing_until)
+        active[key] = candidate
 
-    return sorted(active.values(), key=lambda window: str(window.get("kind")))
+    return sorted(active.values(), key=lambda window: str(_latch_identity(window)))
 
 
 def state_from_decision(
@@ -1142,7 +1178,7 @@ def state_from_decision(
     current_time = now or utc_now()
     short_term_state = _window_state(decision.short_term_window)
     payload = {
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "status": decision.status,
         "sourceStatus": decision.status,
         "sourceReason": decision.reason,
@@ -1163,11 +1199,29 @@ def state_from_decision(
         "weeklyHardBlockEnabled": decision.weekly_hard_block_enabled,
         "source": decision.source,
         "sourceObservedAt": format_timestamp(decision.source_observed_at),
+        "sourceContext": decision.source_context,
         "canonicalLimitId": decision.canonical_limit_id,
         "accountLimitStateKnown": decision.account_limit_state_known,
         "rateLimitStateKnown": decision.rate_limit_state_known,
         "spendControlReached": decision.spend_control_reached,
         "rateLimitReachedType": decision.rate_limit_reached_type,
+        "observation": {
+            "version": 1,
+            "status": decision.status,
+            "source": decision.source,
+            "sourceContext": decision.source_context,
+            "observedAt": format_timestamp(decision.source_observed_at),
+            "canonicalLimitId": decision.canonical_limit_id,
+            "windows": [_window_state(window) for window in decision.quota_windows
+                        if window.kind != WINDOW_KIND_ACCOUNT],
+            "uncertainBlockingKinds": list(decision.uncertain_blocking_kinds),
+            "rateLimitStateKnown": decision.rate_limit_state_known,
+            "rateLimitReachedType": decision.rate_limit_reached_type,
+            "spendControlReached": decision.spend_control_reached,
+            "weeklyHardBlockEnabled": decision.weekly_hard_block_enabled,
+            "thresholdPercent": threshold_percent,
+            "weeklyThresholdPercent": weekly_threshold_percent,
+        },
     }
 
     enforcement_windows = _merged_enforcement_windows(
@@ -1230,9 +1284,113 @@ def write_state(
 
 def read_state(path: Path) -> Dict[str, Any]:
     try:
-        return json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        payload = json.loads(path.read_text())
+        return payload if isinstance(payload, dict) else {}
+    except (UnicodeError, ValueError, RecursionError, OSError):
         return {}
+
+
+def cached_observation(
+    state: Dict[str, Any],
+    *,
+    now: datetime,
+    max_state_age_seconds: int = DEFAULT_MAX_STATE_AGE_SECONDS,
+    quota_config: Optional[QuotaConfig] = None,
+    threshold_percent: Optional[int] = None,
+) -> Optional[QuotaDecision]:
+    """Recover a source decision, not an effective open flag, for latch merging."""
+    snapshot = state.get("observation")
+    if (type(state.get("schemaVersion")) is not int or state.get("schemaVersion") != 5
+            or not isinstance(snapshot, dict)
+            or type(snapshot.get("version")) is not int or snapshot.get("version") != 1
+            or not isinstance(snapshot.get("status"), str)
+            or snapshot.get("status") not in {"open", "blocked", "unknown"}
+            or not state_is_fresh(state, now=now, max_state_age_seconds=max_state_age_seconds)):
+        return None
+    source = snapshot.get("source")
+    observed_at = parse_timestamp(snapshot.get("observedAt"))
+    if (not isinstance(source, str) or _source_authority(source) == 0
+            or observed_at is None or observed_at > now
+            or now - observed_at > timedelta(seconds=max_state_age_seconds)):
+        return None
+    context = snapshot.get("sourceContext")
+    if context is not None and (not isinstance(context, str) or not context):
+        return None
+    windows = snapshot.get("windows")
+    uncertain = snapshot.get("uncertainBlockingKinds")
+    if (not isinstance(windows, list) or not all(isinstance(w, dict) for w in windows)
+            or not isinstance(uncertain, list)
+            or not all(isinstance(kind, str) and kind in {
+                WINDOW_KIND_SHORT_TERM, WINDOW_KIND_WEEKLY, WINDOW_KIND_ACCOUNT,
+                WINDOW_KIND_LONG_TERM, WINDOW_KIND_UNKNOWN} for kind in uncertain)):
+        return None
+    for window in windows:
+        parsed, error = _parse_quota_window(window)
+        if error or parsed is None or parsed.kind != window.get("kind"):
+            return None
+        if not isinstance(window.get("isDefaultLimit"), bool):
+            return None
+    for key in ("thresholdPercent", "weeklyThresholdPercent"):
+        value = snapshot.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+            return None
+    if (not isinstance(snapshot.get("weeklyHardBlockEnabled"), bool)
+            or not isinstance(snapshot.get("rateLimitStateKnown"), bool)
+            or (snapshot.get("spendControlReached") is not None
+                and not isinstance(snapshot.get("spendControlReached"), bool))):
+        return None
+    if (state.get("source") != source or state.get("sourceContext") != context
+            or state.get("sourceObservedAt") != snapshot.get("observedAt")
+            or state.get("sourceStatus") != snapshot.get("status")):
+        return None
+    canonical = snapshot.get("canonicalLimitId")
+    if canonical is not None and (not isinstance(canonical, str) or not canonical):
+        return None
+    usage = {"updatedAt": format_timestamp(observed_at), "activeLimitId": canonical,
+             "windows": windows}
+    if snapshot["rateLimitStateKnown"]:
+        reached = snapshot.get("rateLimitReachedType")
+        if reached is not None and (not isinstance(reached, str) or not reached):
+            return None
+        usage["rateLimitReachedType"] = reached
+    if snapshot.get("spendControlReached") is not None:
+        usage["spendControlReached"] = snapshot["spendControlReached"]
+    payload = [{"provider": DEFAULT_PROVIDER, "source": source,
+                "sourceContext": context, "usage": usage}]
+    try:
+        decision = parse_codex_usage(
+            payload,
+            now=observed_at,
+            threshold_percent=snapshot["thresholdPercent"],
+            quota_config=QuotaConfig(
+                weekly_mode=(WEEKLY_MODE_HARD_BLOCK if snapshot["weeklyHardBlockEnabled"]
+                             else WEEKLY_MODE_ADVISORY),
+                weekly_threshold_percent=snapshot["weeklyThresholdPercent"],
+            ),
+        )
+        if decision.status != snapshot["status"]:
+            return None
+        if quota_config is not None or threshold_percent is not None:
+            decision = parse_codex_usage(
+                payload, now=observed_at,
+                threshold_percent=(min(threshold_percent, snapshot["thresholdPercent"])
+                                   if threshold_percent is not None
+                                   else snapshot["thresholdPercent"]),
+                quota_config=quota_config or QuotaConfig(
+                    weekly_mode=(WEEKLY_MODE_HARD_BLOCK if snapshot["weeklyHardBlockEnabled"]
+                                 else WEEKLY_MODE_ADVISORY),
+                    weekly_threshold_percent=snapshot["weeklyThresholdPercent"]),
+            )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # Normalized window metadata contains nulls that were absent upstream.
+    # Preserve the producer's explicit backend-knowledge flags, not those nulls.
+    return replace(
+        decision, uncertain_blocking_kinds=tuple(uncertain),
+        rate_limit_state_known=snapshot["rateLimitStateKnown"],
+        account_limit_state_known=(snapshot["rateLimitStateKnown"]
+                                   or snapshot.get("spendControlReached") is not None),
+    )
 
 
 def block_until_from_state(
@@ -1627,7 +1785,8 @@ def poll_once(
     now: Optional[datetime] = None,
 ) -> QuotaDecision:
     current_time = now or utc_now()
-    active_config = quota_config or read_config(config_path)
+    active_config = (quota_config or read_valid_config(config_path)
+                     or _retained_policy_config(read_state(state_path)))
     try:
         payload = fetcher() if fetcher is not None else fetch_codex_usage(source=source)
         decision = parse_codex_usage(
@@ -1637,6 +1796,14 @@ def poll_once(
             now=current_time,
             quota_config=active_config,
         )
+        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+        context = {
+            "codexHome": str(codex_home.expanduser().resolve()),
+            "config": str((config_path or default_config_path()).expanduser().resolve()),
+            "source": _normalized_source(decision.source),
+        }
+        decision = replace(decision, source_context=hashlib.sha256(
+            json.dumps(context, sort_keys=True).encode("utf-8")).hexdigest())
     except Exception as exc:
         decision = QuotaDecision(
             status="unknown",
@@ -1724,13 +1891,18 @@ def wait_if_blocked(
     fail_closed_output: Optional[Callable[[str], None]] = None,
     fail_closed_exit_code: int = 2,
     require_fresh_state: bool = False,
+    recovery: Optional[Callable[[], None]] = None,
+    bypass: Optional[Callable[[], bool]] = None,
+    policy_config: Optional[Callable[[], Optional[QuotaConfig]]] = None,
+    threshold_percent: Optional[int] = None,
 ) -> int:
     if os.environ.get("QUOTA_SENTRY_DISABLE") == "1":
         return 0
 
     emitted_wait_message = False
     emitted_notice = False
-    waited_once = False
+    retained: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    last_valid_config = None
     fail_closed_deadline = None
     if fail_closed_after_seconds is not None:
         fail_closed_deadline = monotonic_func() + max(0.0, fail_closed_after_seconds)
@@ -1739,11 +1911,6 @@ def wait_if_blocked(
         state = read_state(state_path)
         current_time = now_func()
         polled_this_iteration = False
-        # Older installed hooks pass require_fresh_state. Keep accepting the
-        # option, but telemetry health without a retained block must not deny a
-        # Codex operation. A confirmed block remains latched below.
-        if waited_once and state.get("status") != "blocked":
-            return 0
         saved_blocked_until = parse_timestamp(state.get("blockedUntil"))
         if (
             not state_only
@@ -1756,25 +1923,85 @@ def wait_if_blocked(
             state = read_state(state_path)
             current_time = now_func()
 
-        block_until = block_until_from_state(state, now=current_time, max_state_age_seconds=max_state_age_seconds)
-        if block_until is None:
-            if state_only:
-                return 0
-            if not polled_this_iteration:
-                poller()
-                state = read_state(state_path)
-                current_time = now_func()
-            block_until = block_until_from_state(
-                state,
-                now=current_time,
-                max_state_age_seconds=max_state_age_seconds,
-            )
-            if block_until is None:
-                return 0
+        if not state_only and not retained and state.get("status") != "blocked" and not polled_this_iteration:
+            poller()
+            state = read_state(state_path)
+            current_time = now_func()
 
-        current_time = now_func()
-        if block_until <= current_time:
+        # A cache read cannot revoke evidence already observed by this invocation.
+        for window in _previous_enforcement_windows(state):
+            key = _latch_identity(window)
+            if key not in retained:
+                retained[key] = window
+        current_config = None
+        if policy_config is not None:
+            try:
+                current_config = policy_config()
+            except Exception:
+                pass
+            if current_config is not None:
+                last_valid_config = current_config
+        effective_config = (current_config or last_valid_config
+                            or _retained_policy_config(state, retained.values()))
+        observation = cached_observation(
+            state, now=current_time, max_state_age_seconds=max_state_age_seconds,
+            quota_config=effective_config if policy_config is not None else None,
+            threshold_percent=threshold_percent)
+        if observation is not None:
+            snapshot = state["observation"]
+            short_threshold = (min(threshold_percent, snapshot["thresholdPercent"])
+                               if threshold_percent is not None else snapshot["thresholdPercent"])
+            weekly_threshold = (effective_config.weekly_threshold_percent if policy_config is not None
+                                else snapshot["weeklyThresholdPercent"])
+            for window in _merged_enforcement_windows(
+                    {}, observation, current_time=current_time,
+                    threshold_percent=short_threshold, weekly_threshold_percent=weekly_threshold):
+                key = _latch_identity(window)
+                if key not in retained:
+                    retained[key] = window
+            remaining = {}
+            for window in retained.values():
+                observed = parse_timestamp(window.get("sourceObservedAt"))
+                if (observed is not None and observation.source_observed_at is not None
+                        and observation.source_observed_at <= observed):
+                    remaining[_latch_identity(window)] = window
+                    continue
+                merged = _merged_enforcement_windows(
+                    {"enforcement": {"status": "blocked", "windows": [window]}},
+                    observation, current_time=current_time,
+                    threshold_percent=short_threshold,
+                    weekly_threshold_percent=weekly_threshold,
+                )
+                for candidate in merged:
+                    remaining[_latch_identity(candidate)] = candidate
+            retained = remaining
+
+        if policy_config is not None:
+            if current_config is not None and current_config.weekly_mode == WEEKLY_MODE_ADVISORY:
+                retained = {key: window for key, window in retained.items()
+                            if window.get("kind") != WINDOW_KIND_WEEKLY}
+        if bypass is not None:
+            try:
+                if bypass():
+                    return 0
+            except Exception:
+                pass
+        if recovery is not None and (retained or observation is None or state.get("status") != "open"
+                or not state_is_fresh(state, now=current_time,
+                                      max_state_age_seconds=max_state_age_seconds)):
+            try:
+                recovery()
+            except Exception:
+                pass
+        if not retained:
             return 0
+        selected = max(retained.values(), key=lambda w: parse_timestamp(w.get("blockedUntil"))
+                       or datetime.min.replace(tzinfo=timezone.utc))
+        block_until = block_until_from_state(
+            {"status": "blocked", "updatedAt": selected.get("lastConfirmedAt"),
+             "blockedUntil": selected.get("blockedUntil")}, now=current_time)
+        if block_until is None:
+            block_until = current_time + timedelta(seconds=DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS)
 
         seconds = float(
             max(
@@ -1800,7 +2027,6 @@ def wait_if_blocked(
             output(f"Quota Sentry: Codex quota guard active until {format_timestamp(block_until)}.")
             emitted_wait_message = True
         sleeper(seconds)
-        waited_once = True
 
 
 def hook_entry(matcher: str, command: str, async_value: bool, timeout_seconds: int) -> Dict[str, Any]:
@@ -1817,49 +2043,63 @@ def hook_entry(matcher: str, command: str, async_value: bool, timeout_seconds: i
     }
 
 
-def blocking_hook_entry(matcher: str, command: str, timeout_seconds: int) -> Dict[str, Any]:
+def blocking_hook_entry(matcher: str, command: str, timeout_seconds: int,
+                        notify_on_block: bool = True) -> Dict[str, Any]:
     entry = hook_entry(matcher, command, False, timeout_seconds)
-    entry["hooks"][0].update(
-        {
-            "notifyOnBlock": True,
-            "statusMessage": "QuotaSentry quota checkpoint",
-        }
-    )
+    if notify_on_block:
+        entry["hooks"][0]["statusMessage"] = "Quota Sentry: quota checkpoint"
     return entry
 
 
 def quota_sentry_hook_commands(script_path: Path) -> Dict[str, str]:
     script = shlex.quote(str(script_path))
-    fail_closed_option = (
-        f"--fail-closed-after-seconds {DEFAULT_HOOK_FAIL_CLOSED_AFTER_SECONDS}"
-    )
     cached_guard = (
         f"{script} guard --state-only --no-notify --read-hook-input "
-        f"--require-fresh-state {fail_closed_option}"
+        "--hook-mode --recover-daemon"
     )
     return {
         "SessionStart": f"{script} start --quiet --read-hook-input",
         "UserPromptSubmit": (
-            f"{script} prompt-guard --read-hook-input --require-fresh-state "
-            f"{fail_closed_option}"
+            f"{script} prompt-guard --read-hook-input --hook-mode --recover-daemon"
         ),
         "PreToolUse": cached_guard,
-        "PostToolUse": f"{cached_guard} --fail-closed-format block-json",
-        "PreCompact": f"{cached_guard} --fail-closed-format stop-json",
+        "PostToolUse": cached_guard,
+        "PreCompact": cached_guard,
+        "PreModelRequest": cached_guard,
+        "PostModelRequest": cached_guard,
     }
 
 
-def _remove_existing_quota_sentry(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _remove_existing_quota_sentry(
+    entries: List[Dict[str, Any]], script_path: Path,
+) -> List[Dict[str, Any]]:
+    def is_quota_sentry(hook):
+        command = hook.get("command") if isinstance(hook, dict) else None
+        if not isinstance(command, str):
+            return False
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            return False
+        return bool(words and (Path(words[0]).name == "quota-sentry"
+                               or words[0] == str(script_path)))
+
     filtered = []
     for entry in entries:
         hooks = entry.get("hooks", []) if isinstance(entry, dict) else []
-        serialized = json.dumps(hooks)
-        if "quota-sentry" not in serialized and "Quota Sentry" not in serialized:
+        if not isinstance(hooks, list):
             filtered.append(entry)
+            continue
+        remaining = [hook for hook in hooks if not is_quota_sentry(hook)]
+        if len(remaining) == len(hooks):
+            filtered.append(entry)
+        elif remaining:
+            filtered.append({**entry, "hooks": remaining})
     return filtered
 
 
-def merge_codex_hooks(existing: Dict[str, Any], script_path: Path) -> Dict[str, Any]:
+def merge_codex_hooks(existing: Dict[str, Any], script_path: Path,
+                      notify_on_block: bool = True) -> Dict[str, Any]:
     merged = json.loads(json.dumps(existing or {}))
     hooks = merged.setdefault("hooks", {})
     commands = quota_sentry_hook_commands(script_path)
@@ -1869,16 +2109,22 @@ def merge_codex_hooks(existing: Dict[str, Any], script_path: Path) -> Dict[str, 
             "startup|resume|clear|compact", commands["SessionStart"], False, 30
         ),
         "UserPromptSubmit": blocking_hook_entry(
-            "", commands["UserPromptSubmit"], DEFAULT_HOOK_TIMEOUT_SECONDS
+            "", commands["UserPromptSubmit"], DEFAULT_HOOK_TIMEOUT_SECONDS, notify_on_block
         ),
         "PreToolUse": blocking_hook_entry(
-            ".*", commands["PreToolUse"], DEFAULT_HOOK_TIMEOUT_SECONDS
+            ".*", commands["PreToolUse"], DEFAULT_HOOK_TIMEOUT_SECONDS, notify_on_block
         ),
         "PostToolUse": blocking_hook_entry(
-            ".*", commands["PostToolUse"], DEFAULT_HOOK_TIMEOUT_SECONDS
+            ".*", commands["PostToolUse"], DEFAULT_HOOK_TIMEOUT_SECONDS, notify_on_block
         ),
         "PreCompact": blocking_hook_entry(
-            ".*", commands["PreCompact"], DEFAULT_HOOK_TIMEOUT_SECONDS
+            ".*", commands["PreCompact"], DEFAULT_HOOK_TIMEOUT_SECONDS, notify_on_block
+        ),
+        "PreModelRequest": blocking_hook_entry(
+            "", commands["PreModelRequest"], DEFAULT_HOOK_TIMEOUT_SECONDS, notify_on_block
+        ),
+        "PostModelRequest": blocking_hook_entry(
+            "", commands["PostModelRequest"], DEFAULT_HOOK_TIMEOUT_SECONDS, notify_on_block
         ),
     }
 
@@ -1886,7 +2132,7 @@ def merge_codex_hooks(existing: Dict[str, Any], script_path: Path) -> Dict[str, 
         current_entries = hooks.get(event_name)
         if not isinstance(current_entries, list):
             current_entries = []
-        hooks[event_name] = _remove_existing_quota_sentry(current_entries) + [entry]
+        hooks[event_name] = _remove_existing_quota_sentry(current_entries, script_path) + [entry]
 
     return merged
 
@@ -1902,6 +2148,8 @@ def _exact_quota_sentry_hook_metadata(
         "PreToolUse": "preToolUse",
         "PostToolUse": "postToolUse",
         "PreCompact": "preCompact",
+        "PreModelRequest": "preModelRequest",
+        "PostModelRequest": "postModelRequest",
     }
     commands = quota_sentry_hook_commands(script_path)
     expected = {event_names[name]: command for name, command in commands.items()}
@@ -1970,6 +2218,7 @@ def verify_quota_sentry_hooks_active(
     hooks_list_result: Any,
     hooks_path: Path,
     script_path: Path,
+    notify_on_block: bool = True,
 ) -> int:
     discovered = _exact_quota_sentry_hook_metadata(
         hooks_list_result,
@@ -1982,6 +2231,8 @@ def verify_quota_sentry_hooks_active(
         "preToolUse": DEFAULT_HOOK_TIMEOUT_SECONDS,
         "postToolUse": DEFAULT_HOOK_TIMEOUT_SECONDS,
         "preCompact": DEFAULT_HOOK_TIMEOUT_SECONDS,
+        "preModelRequest": DEFAULT_HOOK_TIMEOUT_SECONDS,
+        "postModelRequest": DEFAULT_HOOK_TIMEOUT_SECONDS,
     }
     expected_matchers = {
         "sessionStart": "startup|resume|clear|compact",
@@ -1989,8 +2240,16 @@ def verify_quota_sentry_hooks_active(
         "preToolUse": ".*",
         "postToolUse": ".*",
         "preCompact": ".*",
+        "preModelRequest": None,
+        "postModelRequest": None,
     }
     for event_name, metadata in discovered.items():
+        if metadata.get("async", False) is not False:
+            raise RuntimeError(f"Quota Sentry {event_name} hook is asynchronous")
+        expected_status = ("Quota Sentry: quota checkpoint"
+                           if notify_on_block and event_name != "sessionStart" else None)
+        if metadata.get("statusMessage") != expected_status:
+            raise RuntimeError(f"Quota Sentry {event_name} hook has unexpected status message")
         if metadata.get("enabled") is not True:
             raise RuntimeError(f"Quota Sentry {event_name} hook is disabled")
         if metadata.get("trustStatus") not in {"trusted", "managed"}:
@@ -2014,6 +2273,7 @@ def trust_codex_hooks(
     *,
     cwd: Path,
     timeout_seconds: int = DEFAULT_CODEX_APP_SERVER_TIMEOUT_SECONDS,
+    notify_on_block: bool = True,
 ) -> int:
     process = subprocess.Popen(
         ["codex", "app-server", "--stdio"],
@@ -2125,6 +2385,7 @@ def trust_codex_hooks(
             verify_response.get("result"),
             hooks_path=hooks_path,
             script_path=script_path,
+            notify_on_block=notify_on_block,
         )
     finally:
         if process.poll() is None:

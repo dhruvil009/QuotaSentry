@@ -74,7 +74,7 @@ Once a quota block is confirmed, source failures, malformed sibling windows, sta
 
 ## What It Watches
 
-The `v0.1.x` line supports Codex only:
+Codex is the original provider; Claude Code is supported through `--provider claude` (see [Claude Code](#claude-code)). For Codex:
 
 - Uses `codex app-server --stdio` by default, reading `account/rateLimits/read`.
 - Treats Codex app-server as the sole authority in default `auto` mode. Source failure becomes `unknown`; it never downgrades to CodexBar to clear a latch.
@@ -192,6 +192,51 @@ Model hooks are not universal provider gates. Internal resampling, memory/backgr
 
 Long-running hooks use Codex's native, static `Quota Sentry: quota checkpoint` label. Quiet completion removes it without repeated model context or terminal writes. It cannot dynamically identify only quota blocks or show a live reset countdown. To omit custom text, set `"notifyOnBlock": false` in Quota Sentry's config, regenerate/trust hooks and restart Codex. This does not hide every generic native hook indicator or disable enforcement.
 
+## Claude Code
+
+Claude Code uses the same daemon, block rules and hook guard as Codex. Every
+command takes `--provider claude`, and Claude keeps its own state in
+`~/.cache/quota-sentry/claude/`.
+
+```bash
+./scripts/quota-sentry login --provider claude
+./scripts/quota-sentry poll --provider claude
+./scripts/quota-sentry start --provider claude
+./scripts/quota-sentry install-hook --provider claude
+./scripts/quota-sentry status --provider claude
+```
+
+- **Sign-in:** `login` prints a Claude sign-in link. Approve it in your
+  browser and paste back the code from the last page; it contains a `#`.
+  Quota Sentry saves its own login to
+  `~/.config/quota-sentry/claude-credentials.json`, readable only by you, and
+  renews it itself. It never reads the Keychain or Claude Code's login.
+  `logout --provider claude` deletes the file.
+- **Source:** the daemon reads Anthropic's plan-usage endpoint directly. No
+  Claude Code process runs, so `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
+  can stay on. `five_hour` blocks at 90% used and `seven_day` at 99%, under
+  the same weekly configuration as Codex. Model-only weekly rows are advisory.
+- **Pacing:** at most one read per 60 s, even when waiting hooks ask for a
+  refresh. HTTP 403/429 holds reads for `Retry-After`, or 5 minutes, capped at
+  1 hour. A rejected sign-in is not retried for an hour unless you run
+  `login` again.
+- **Hooks:** `install-hook --provider claude` merges `SessionStart`,
+  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolBatch` and
+  `PreCompact` into `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`). It
+  takes a lock, writes a `.bak`, preserves other settings and their order,
+  and keeps the file's mode. Claude Code reloads settings hooks while running;
+  check `/hooks`.
+- **Bypass:** `QUOTA_SENTRY_DISABLE=1` and `exemptCwds` work the same way.
+
+Limits:
+
+- The usage endpoint is undocumented.
+- The sign-in uses Claude Code's public client ID and addresses from the
+  2.1.332 build. A change there makes readings `unknown` until you run
+  `login` again; with no block held, work continues.
+- Claude has no model-request hook. `PostToolBatch` is the last checkpoint
+  before the next model request inside a tool loop.
+
 ## Enforcement Limits
 
 Quota Sentry cannot interrupt a model request that is already in flight. It blocks at the next supported Codex lifecycle checkpoint. A single uninterrupted model response can therefore consume quota before any hook can run.
@@ -254,7 +299,7 @@ For clean clones without installed Codex hooks, the global hook scenario is skip
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for development workflow, test expectations, hook-safety guidance, AI-generated code expectations, and guidance for adding other harnesses such as Claude Code or OpenCode.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for development workflow, test expectations, hook-safety guidance, AI-generated code expectations, and guidance for adding other harnesses such as OpenCode.
 
 ## License
 

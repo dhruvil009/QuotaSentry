@@ -1,6 +1,6 @@
 # Contributing to Quota Sentry
 
-Thanks for improving Quota Sentry. The first supported harness is Codex, but the project is meant to grow into a set of quota guards for other agent harnesses such as Claude Code, OpenCode, and similar local CLIs.
+Thanks for improving Quota Sentry. It supports Codex and Claude Code (`--provider claude`), and is meant to grow into a set of quota guards for other agent harnesses such as OpenCode and similar local CLIs. The Claude adapter in `src/quota_sentry/core.py` (`fetch_claude_usage_api`, `merge_claude_hooks`) is the reference for how a new provider plugs into the shared daemon, state and hooks.
 
 ## Project Direction
 

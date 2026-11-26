@@ -97,6 +97,74 @@ defensible next steps are an upstream/fork primitive that can suspend compact
 timeout accounting and expose a supported non-model status, or a separately
 approved narrower product contract. Neither is production authorization.
 
+## Claude Code Provider Flow (Approved 2026-11-26)
+
+Claude Code support copies the Codex workflow above. The same daemon, cache
+policy and hook guard run with `--provider claude`, against their own state
+directory, `~/.cache/quota-sentry/claude/`. The only Claude-specific parts are
+the quota source, the sign-in that source uses, and its pacing. Codex state,
+hooks and commands are unchanged.
+
+```mermaid
+flowchart LR
+    H["Claude Code hooks<br/>(~/.claude/settings.json)"] -->|read only| S[("claude/state.json")]
+    D["quota-sentry daemon<br/>--provider claude"] -->|writes| S
+    L[("Quota Sentry's own sign-in<br/>~/.config/quota-sentry/claude-credentials.json")] --> D
+    D -->|"GET /api/oauth/usage<br/>at most once per 60 s"| U["Anthropic usage endpoint"]
+    D -->|"renew when under 5 min left"| T["Anthropic token endpoint"]
+```
+
+- **Source:** Anthropic's plan-usage endpoint, read by Quota Sentry itself.
+  With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` on, Claude Code refuses to
+  fetch quota in any process, so no Claude Code process is involved.
+  `five_hour` is the 300-minute window and `seven_day` the 10,080-minute
+  window. Other `seven_day_*` rows, such as model-only limits, are advisory.
+- **Sign-in:** `quota-sentry login --provider claude` runs Claude's browser
+  sign-in (PKCE, scope `user:profile`) and stores the result in a file only
+  its owner can read. Quota Sentry renews that login itself. It never reads
+  the Keychain or Claude Code's own login.
+- **Pacing:** mirrors Claude Code's own handling of this endpoint. The daemon
+  reads at most once per 60 s, even when hooks request an early refresh. HTTP
+  403/429 holds reads for `Retry-After`, or 5 minutes, capped at 1 hour. A
+  rejected or unrenewable sign-in is not retried for 1 hour unless a new
+  `login` replaces it.
+
+### Claude Hook Truth Table
+
+| Claude state | Block remembered? | Hook action | Daemon action | Claude outcome |
+| --- | --- | --- | --- | --- |
+| Fresh `open` | No | Return success | Normal cadence, 60 s minimum spacing | Continue |
+| Stale `open` | No | Request refresh, return success | Read once spacing allows | Continue |
+| `unknown`: no sign-in, rejected sign-in, endpoint error or hold | No | Request refresh, return success | Retry at the next allowed read | Continue |
+| Missing or malformed state | No observable block | Request refresh, return success | Rewrite state | Continue |
+| `blocked`: 5h at 90% or more, or weekly at 99% or more | Yes | Wait, re-reading state at most every 30 s | Read at most every 60 s | Wait for a newer reading below threshold |
+| Blocked, then source failure, stale data or hold | Yes | Keep waiting | Keep the block; retry after the hold | Wait |
+| Blocked, and the reported reset time passes | Yes | Keep waiting | Read again; only a reading below threshold releases | Wait |
+| Bypass variable or exempt directory | Either | Return success | None | Continue |
+
+| Hook event | Command | Outcome |
+| --- | --- | --- |
+| `SessionStart` (`startup\|resume\|clear\|compact`) | `start --quiet --read-hook-input --provider claude` | Starts the daemon; never waits |
+| `UserPromptSubmit` | `prompt-guard ... --provider claude` | Continue or wait; never denies |
+| `PreToolUse`, `PostToolUse` (`*`) | `guard --state-only ... --provider claude` | Continue or wait; never denies |
+| `PostToolBatch` | Same guard | Waits before Claude's next model request; never denies |
+| `PreCompact` | Same guard | Continue or wait; never denies |
+
+Blocking hooks use the 366-day timeout and the static `Quota Sentry: quota
+checkpoint` status, and print nothing. Claude has no `PreModelRequest` or
+`PostModelRequest` hook. `PostToolBatch` is the last checkpoint before the next
+model request inside a tool loop. A request that is already in flight can still
+consume quota.
+
+Known limits:
+
+- The usage endpoint is undocumented.
+- The sign-in uses Claude Code's public client ID and Anthropic's addresses,
+  taken from the 2.1.332 build. A change there makes readings `unknown` until
+  you run `login` again.
+- Whether Anthropic accepts a `user:profile`-only sign-in is confirmed only by
+  the first real `login`.
+
 ## Mandatory Change Approval Gate
 
 No future change to quota classification, state persistence, latch release,
@@ -604,6 +672,7 @@ not waive the approval gate for future changes.
 | Revision 4 global-admission design | Historical/proposed target flow; feasibility `REJECTED`, production implementation `BLOCKED` | User approved the target contract on 2026-09-29; exact `0.144.6` failed compact same-operation preservation on 2026-09-30 |
 | Isolated admission feasibility spike | Tasks 1-3 `PASS`; Task 4 `REJECTED`; Tasks 5-8 `NOT_RUN (hard stop)` | The original compact turn failed at its four-interval timeout while the front door retained one request; later release could not revive it |
 | Isolated feasibility-spike plan | Approved and executed only as far as the first-non-`PASS` rule permits | `docs/superpowers/plans/2026-09-29-provider-admission-feasibility-spike.md`; controlling evidence is linked from the feasibility report above |
+| Claude Code provider flow | Approved; implemented in the working tree, not yet installed | 2026-11-26: Codex-parity design with Anthropic's usage endpoint as the source ("Yes, use it"); no Keychain access; Quota Sentry's own sign-in file ("Own sign-in file"); pacing added after the user asked for an OAuth rate-limit check |
 
 ## Superseded Hook-Only Replacement Flow
 

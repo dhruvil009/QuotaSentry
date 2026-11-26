@@ -4,6 +4,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -142,8 +143,19 @@ def status_health_warnings(
     return []
 
 
-def resolve_state_dir(value: Optional[str]) -> Path:
-    return Path(value).expanduser().resolve() if value else core.cache_dir()
+def provider_of(args: argparse.Namespace) -> str:
+    return getattr(args, "provider", None) or core.DEFAULT_PROVIDER
+
+
+def resolve_state_dir(value: Optional[str], provider: str = core.DEFAULT_PROVIDER) -> Path:
+    if value:
+        return Path(value).expanduser().resolve()
+    # Codex keeps the original cache root; each other provider gets its own subdirectory.
+    return core.cache_dir() if provider == core.DEFAULT_PROVIDER else core.cache_dir() / provider
+
+
+def args_state_dir(args: argparse.Namespace) -> Path:
+    return resolve_state_dir(args.state_dir, provider_of(args))
 
 
 def resolve_config_path(value: Optional[str]) -> Path:
@@ -180,6 +192,10 @@ def default_codex_hooks_path() -> Path:
     codex_home = os.environ.get("CODEX_HOME")
     root = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
     return root / "hooks.json"
+
+
+def default_claude_settings_path() -> Path:
+    return core.claude_config_dir() / "settings.json"
 
 
 def consume_hook_input(args: argparse.Namespace) -> None:
@@ -234,7 +250,7 @@ def request_refresh_if_needed(
 
 
 def request_daemon_recovery(args: argparse.Namespace) -> None:
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = args_state_dir(args)
     core.request_refresh(core.default_refresh_request_path(state_dir))
     if not getattr(args, "recover_daemon", False) or core.fcntl is None:
         return
@@ -244,6 +260,8 @@ def request_daemon_recovery(args: argparse.Namespace) -> None:
                "--source", args.source]
     if args.config_path:
         command.extend(["--config-path", str(resolve_config_path(args.config_path))])
+    if provider_of(args) != core.DEFAULT_PROVIDER:
+        command.extend(["--provider", provider_of(args)])
     startup = build_parser().parse_args(command[1:])
     pid = read_pid(core.default_pid_path(state_dir))
     if pid and is_quota_sentry_daemon(pid, state_dir, expected_args=startup,
@@ -279,7 +297,7 @@ def hook_policy_config(args: argparse.Namespace) -> Optional[core.QuotaConfig]:
 
 
 def hook_guard_command(args: argparse.Namespace) -> int:
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = args_state_dir(args)
 
     def bypass():
         config = hook_policy_config(args)
@@ -323,11 +341,15 @@ def daemon_command_is_compatible(
         args.config_path
     ):
         return False
+    running_provider = _command_option(command, "--provider") or core.DEFAULT_PROVIDER
+    if running_provider != provider_of(args):
+        return False
 
     running_source = _command_option(command, "--source")
     requested_source = args.source
-    if requested_source in {core.AUTO_SOURCE, core.CODEX_APP_SERVER_SOURCE}:
-        if running_source not in {core.AUTO_SOURCE, core.CODEX_APP_SERVER_SOURCE}:
+    authoritative = {core.AUTO_SOURCE, core.CODEX_APP_SERVER_SOURCE, core.CLAUDE_USAGE_API_SOURCE}
+    if requested_source in authoritative:
+        if running_source not in authoritative:
             return False
     elif running_source != requested_source:
         return False
@@ -499,8 +521,61 @@ def percent_value(value: str) -> int:
     return percent
 
 
+def poll_spacing_seconds(args: argparse.Namespace) -> int:
+    configured = getattr(args, "min_poll_spacing_seconds", None)
+    if configured is not None:
+        return max(0, int(configured))
+    return core.CLAUDE_MIN_POLL_SPACING_SECONDS if provider_of(args) == core.CLAUDE_PROVIDER else 0
+
+
+def poll_spacing_wait_seconds(last_poll: Optional[float], now: float, spacing: float) -> float:
+    """Seconds still to wait before the next source read; refresh requests cannot shorten it."""
+    if last_poll is None or spacing <= 0:
+        return 0
+    return max(0, last_poll + spacing - now)
+
+
+def login_command(args: argparse.Namespace) -> int:
+    if provider_of(args) != core.CLAUDE_PROVIDER:
+        print("Quota Sentry: login is only used with --provider claude", file=sys.stderr)
+        return 2
+    start = core.claude_oauth_start()
+    print("Quota Sentry: open this link in your browser and approve read access to your "
+          "Claude usage. The last page shows a code; paste all of it here.")
+    print(start["url"])
+    try:
+        pasted = input("Code: ")
+    except EOFError:
+        print("Quota Sentry: no code entered; sign-in cancelled", file=sys.stderr)
+        return 1
+    path = core.claude_credentials_path()
+    try:
+        stored = core.claude_oauth_exchange(pasted, verifier=start["verifier"],
+                                            state=start["state"])
+        core.write_claude_credentials(path, stored)
+    except (RuntimeError, ValueError, OSError) as exc:
+        print(f"Quota Sentry: Claude sign-in failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Quota Sentry: saved the Claude sign-in to {path} (readable only by you)")
+    return 0
+
+
+def logout_command(args: argparse.Namespace) -> int:
+    if provider_of(args) != core.CLAUDE_PROVIDER:
+        print("Quota Sentry: logout is only used with --provider claude", file=sys.stderr)
+        return 2
+    path = core.claude_credentials_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        print("Quota Sentry: no Claude sign-in was saved")
+        return 0
+    print(f"Quota Sentry: removed the Claude sign-in at {path}")
+    return 0
+
+
 def poll_command(args: argparse.Namespace) -> int:
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = args_state_dir(args)
     state_path = core.default_state_path(state_dir)
     core.poll_once(
         state_path,
@@ -508,6 +583,7 @@ def poll_command(args: argparse.Namespace) -> int:
         reset_buffer_seconds=args.reset_buffer_seconds,
         source=args.source,
         config_path=resolve_config_path(args.config_path),
+        provider=provider_of(args),
     )
     print(status_text(core.read_state(state_path)))
     return 0
@@ -521,7 +597,7 @@ def daemon_command(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = args_state_dir(args)
     pid_path = core.default_pid_path(state_dir)
     lock_handle = try_acquire_daemon_lock(core.default_daemon_lock_path(state_dir))
     if lock_handle is None:
@@ -539,16 +615,29 @@ def daemon_command(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    spacing = poll_spacing_seconds(args)
+    last_poll: Optional[float] = None
 
     try:
         while keep_running:
+            # Some sources (Claude) must not be read faster than a fixed spacing,
+            # even when a parked hook asks for an early refresh.
+            while keep_running:
+                remaining = poll_spacing_wait_seconds(last_poll, time.monotonic(), spacing)
+                if remaining <= 0:
+                    break
+                time.sleep(min(1, remaining))
+            if not keep_running:
+                break
             core.consume_refresh_request(refresh_request_path)
+            last_poll = time.monotonic()
             decision = core.poll_once(
                 state_path,
                 threshold_percent=args.threshold_percent,
                 reset_buffer_seconds=args.reset_buffer_seconds,
                 source=args.source,
                 config_path=resolve_config_path(args.config_path),
+                provider=provider_of(args),
             )
             persisted_state = core.read_state(state_path)
             print(status_text(persisted_state), flush=True)
@@ -590,7 +679,7 @@ def start_command(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return 1
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = args_state_dir(args)
     pid_path = core.default_pid_path(state_dir)
     existing_pid = read_pid(pid_path)
     current_runtime_fingerprint = runtime_fingerprint()
@@ -661,6 +750,9 @@ def start_command(args: argparse.Namespace) -> int:
     ]
     if args.config_path:
         command.extend(["--config-path", str(resolve_config_path(args.config_path))])
+    if provider_of(args) != core.DEFAULT_PROVIDER:
+        command.extend(["--provider", provider_of(args),
+                        "--min-poll-spacing-seconds", str(poll_spacing_seconds(args))])
     with log_path.open("ab") as log_file:
         process = subprocess.Popen(
             command,
@@ -689,7 +781,7 @@ def start_command(args: argparse.Namespace) -> int:
 
 
 def stop_command(args: argparse.Namespace) -> int:
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = args_state_dir(args)
     pid_path = core.default_pid_path(state_dir)
     pid = read_pid(pid_path)
     if not pid:
@@ -720,7 +812,7 @@ def stop_command(args: argparse.Namespace) -> int:
 
 
 def status_command(args: argparse.Namespace) -> int:
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = args_state_dir(args)
     state = core.read_state(core.default_state_path(state_dir))
     print(status_text(state))
     pid = read_pid(core.default_pid_path(state_dir))
@@ -742,7 +834,7 @@ def guard_command(args: argparse.Namespace) -> int:
     ):
         return 0
 
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = args_state_dir(args)
     state_path = core.default_state_path(state_dir)
     request_refresh_if_needed(
         state_dir,
@@ -756,6 +848,7 @@ def guard_command(args: argparse.Namespace) -> int:
             reset_buffer_seconds=args.reset_buffer_seconds,
             source=args.source,
             config_path=resolve_config_path(args.config_path),
+            provider=provider_of(args),
         )
 
     if args.fail_closed_format == "stop-json":
@@ -810,7 +903,99 @@ def prompt_guard_command(args: argparse.Namespace) -> int:
     return guard_command(args)
 
 
+def _parse_claude_settings(raw: Optional[bytes]) -> Dict[str, Any]:
+    if raw is None or not raw.strip():
+        return {}
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Claude Code settings must be a JSON object")
+    return payload
+
+
+def install_claude_hook_command(args: argparse.Namespace) -> int:
+    if core.fcntl is None:
+        print(
+            "Quota Sentry: hook enforcement requires POSIX file locking; "
+            "this platform is not supported.",
+            file=sys.stderr,
+        )
+        return 1
+    # The parser's --hooks-path default is the Codex file; Claude uses its own settings.
+    requested = args.hooks_path
+    if not requested or requested == str(default_codex_hooks_path()):
+        requested = str(default_claude_settings_path())
+    settings_path = Path(requested).expanduser().resolve()
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    install_lock = try_acquire_daemon_lock(
+        settings_path.with_suffix(settings_path.suffix + ".quota-sentry-install.lock")
+    )
+    if install_lock is None:
+        print("Quota Sentry: another hook installation is already running", file=sys.stderr)
+        return 1
+
+    backup_path = settings_path.with_suffix(settings_path.suffix + ".bak")
+    selected_script_path = (
+        Path(args.script_path).expanduser().resolve() if args.script_path else script_path()
+    )
+    notify_on_block = core.read_config(resolve_config_path(args.config_path)).notify_on_block
+    written_over: Optional[Optional[bytes]] = None
+    wrote = False
+    try:
+        for _attempt in range(3):
+            before = settings_path.read_bytes() if settings_path.exists() else None
+            existing = _parse_claude_settings(before)
+            merged = core.merge_claude_hooks(
+                existing, selected_script_path, notify_on_block=notify_on_block)
+            if merged == existing:
+                break
+            rendered = (json.dumps(merged, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+            # Claude Code writes this file too; never replace a change made after our read.
+            current = settings_path.read_bytes() if settings_path.exists() else None
+            if current != before:
+                continue
+            if before is not None and before.strip():
+                core.write_bytes_atomic(backup_path, before)
+                print(f"Quota Sentry: backed up existing Claude Code settings to {backup_path}")
+            mode = stat.S_IMODE(settings_path.stat().st_mode) if before is not None else None
+            core.write_bytes_atomic(settings_path, rendered, mode=mode)
+            written_over, wrote = before, True
+            break
+        else:
+            raise RuntimeError("Claude Code settings kept changing during installation")
+        installed = _parse_claude_settings(settings_path.read_bytes())
+        if not core.claude_hooks_installed(installed, selected_script_path, notify_on_block):
+            raise RuntimeError("installed Claude Code hooks failed verification")
+    except Exception as exc:
+        if wrote:
+            try:
+                if written_over is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    core.write_bytes_atomic(settings_path, written_over)
+            except OSError as rollback_exc:
+                print(
+                    f"Quota Sentry: installation failed and rollback also failed: {rollback_exc}",
+                    file=sys.stderr,
+                )
+                return 1
+        print(
+            "Quota Sentry: could not install Claude Code hooks; the previous settings "
+            f"were kept: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        release_daemon_lock(install_lock)
+
+    print(f"Quota Sentry: installed Claude Code hooks in {settings_path}")
+    print("Quota Sentry: Claude Code reloads settings hooks while running; "
+          "check /hooks and restart any session that does not list them.")
+    return 0
+
+
 def install_hook_command(args: argparse.Namespace) -> int:
+    if provider_of(args) == core.CLAUDE_PROVIDER:
+        return install_claude_hook_command(args)
     if core.fcntl is None:
         print(
             "Quota Sentry: hook enforcement requires POSIX file locking; "
@@ -955,9 +1140,16 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--recover-daemon", action="store_true", help=argparse.SUPPRESS)
     common.add_argument(
         "--source",
-        choices=[core.AUTO_SOURCE, core.CODEX_APP_SERVER_SOURCE, core.CODEXBAR_SOURCE],
+        choices=[core.AUTO_SOURCE, core.CODEX_APP_SERVER_SOURCE, core.CODEXBAR_SOURCE,
+                 core.CLAUDE_USAGE_API_SOURCE],
         default=core.DEFAULT_USAGE_SOURCE,
         help="Quota source for live polling. Default: auto.",
+    )
+    common.add_argument(
+        "--provider",
+        choices=list(core.PROVIDERS),
+        default=core.DEFAULT_PROVIDER,
+        help="Harness whose quota is guarded. Default: codex.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -978,6 +1170,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=core.DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS,
     )
+    daemon_parser.add_argument(
+        "--min-poll-spacing-seconds", type=int, default=None,
+        help="Minimum seconds between quota reads, even on refresh requests. "
+             "Default: 60 for Claude, 0 for Codex.")
     daemon_parser.add_argument("--runtime-fingerprint", default=None, help=argparse.SUPPRESS)
     daemon_parser.add_argument(
         "--config-path-fingerprint", default=None, help=argparse.SUPPRESS
@@ -998,6 +1194,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=core.DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS,
     )
+    start_parser.add_argument(
+        "--min-poll-spacing-seconds", type=int, default=None,
+        help="Minimum seconds between quota reads, even on refresh requests. "
+             "Default: 60 for Claude, 0 for Codex.")
     start_parser.add_argument("--quiet", action="store_true")
     start_parser.set_defaults(func=start_command)
 
@@ -1068,9 +1268,21 @@ def build_parser() -> argparse.ArgumentParser:
     prompt_guard_parser.set_defaults(func=prompt_guard_command)
 
     install_parser = subparsers.add_parser("install-hook", parents=[common])
-    install_parser.add_argument("--hooks-path", default=str(default_codex_hooks_path()))
+    install_parser.add_argument(
+        "--hooks-path", default=str(default_codex_hooks_path()),
+        help="Codex hooks.json (default: $CODEX_HOME/hooks.json) or, with --provider claude, "
+             "Claude Code settings.json (default: ~/.claude/settings.json).")
     install_parser.add_argument("--script-path", default=None)
     install_parser.set_defaults(func=install_hook_command)
+
+    login_parser = subparsers.add_parser(
+        "login", parents=[common],
+        help="Sign Quota Sentry in to Claude (with --provider claude) to read plan usage.")
+    login_parser.set_defaults(func=login_command)
+
+    logout_parser = subparsers.add_parser(
+        "logout", parents=[common], help="Remove Quota Sentry's saved Claude sign-in.")
+    logout_parser.set_defaults(func=logout_command)
 
     configure_parser = subparsers.add_parser("configure", parents=[common])
     configure_parser.add_argument(
@@ -1087,6 +1299,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    claude_sources = {core.AUTO_SOURCE, core.CLAUDE_USAGE_API_SOURCE}
+    if provider_of(args) == core.CLAUDE_PROVIDER and args.source not in claude_sources:
+        parser.error(f"--source {args.source} reads Codex quota; Claude uses auto or "
+                     f"{core.CLAUDE_USAGE_API_SOURCE}")
+    if provider_of(args) == core.DEFAULT_PROVIDER and args.source == core.CLAUDE_USAGE_API_SOURCE:
+        parser.error(f"--source {args.source} reads Claude quota; add --provider claude")
     try:
         return args.func(args)
     except Exception:

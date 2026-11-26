@@ -1,13 +1,19 @@
+import base64
 import hashlib
+import ipaddress
 import json
 import math
 import os
 import queue
+import secrets
 import shlex
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -21,9 +27,36 @@ except ImportError:  # pragma: no cover - Windows fallback is process-local.
 
 
 DEFAULT_PROVIDER = "codex"
+CLAUDE_PROVIDER = "claude"
+PROVIDERS = (DEFAULT_PROVIDER, CLAUDE_PROVIDER)
 CODEXBAR_SOURCE = "codexbar"
 CODEX_APP_SERVER_SOURCE = "codex-app-server"
+CLAUDE_USAGE_API_SOURCE = "claude-usage-api"
 AUTO_SOURCE = "auto"
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_USAGE_URL_OVERRIDE_ENV = "QUOTA_SENTRY_CLAUDE_USAGE_URL"
+CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
+# Claude's public sign-in client and endpoints, as used by Claude Code 2.1.332.
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
+CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_OAUTH_REDIRECT_URL = "https://platform.claude.com/oauth/code/callback"
+CLAUDE_TOKEN_URL_OVERRIDE_ENV = "QUOTA_SENTRY_CLAUDE_TOKEN_URL"
+# Reading plan usage needs only the profile scope.
+CLAUDE_OAUTH_SCOPES = ("user:profile",)
+CLAUDE_CREDENTIALS_FILENAME = "claude-credentials.json"
+CLAUDE_TOKEN_RENEW_MARGIN_SECONDS = 300
+CLAUDE_USAGE_HOLD_FILENAME = "claude-usage.hold"
+DEFAULT_CLAUDE_USAGE_TIMEOUT_SECONDS = 15
+# Claude Code's own pacing for this endpoint: a reading is reused for 60 s,
+# 403/429 hold for Retry-After or 5 minutes (at most an hour), and a rejected
+# login is not retried for an hour.
+CLAUDE_MIN_POLL_SPACING_SECONDS = 60
+CLAUDE_RATE_LIMIT_HOLD_DEFAULT_SECONDS = 300
+CLAUDE_RATE_LIMIT_HOLD_MAX_SECONDS = 3600
+CLAUDE_AUTH_REJECTED_HOLD_SECONDS = 3600
+# Claude names its plan windows; the names carry the durations.
+CLAUDE_DEFAULT_WINDOWS = (("five_hour", 300), ("seven_day", 10080))
 WEEKLY_MODE_ADVISORY = "advisory"
 WEEKLY_MODE_HARD_BLOCK = "hard-block"
 DEFAULT_WEEKLY_MODE = WEEKLY_MODE_HARD_BLOCK
@@ -91,6 +124,7 @@ class QuotaWindow:
     source_slot: Optional[str] = None
     is_default_limit: bool = True
     rate_limit_reached_type: Optional[str] = None
+    provider: str = DEFAULT_PROVIDER
 
 
 @dataclass(frozen=True)
@@ -219,7 +253,7 @@ def write_json_atomic(path: Path, payload: Any) -> None:
         temp_path.unlink(missing_ok=True)
 
 
-def write_bytes_atomic(path: Path, payload: bytes) -> None:
+def write_bytes_atomic(path: Path, payload: bytes, mode: Optional[int] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -229,6 +263,8 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
         temp_path.replace(path)
     finally:
@@ -395,12 +431,20 @@ def emit_terminal_notice(message: str) -> None:
             os.close(fd)
 
 
-def _codex_entry(payload: Any) -> Optional[Dict[str, Any]]:
+def _provider_entry(payload: Any, provider: str = DEFAULT_PROVIDER) -> Optional[Dict[str, Any]]:
     entries = payload if isinstance(payload, list) else [payload]
     for entry in entries:
-        if isinstance(entry, dict) and entry.get("provider") == DEFAULT_PROVIDER:
+        if isinstance(entry, dict) and entry.get("provider") == provider:
             return entry
     return None
+
+
+def _codex_entry(payload: Any) -> Optional[Dict[str, Any]]:
+    return _provider_entry(payload, DEFAULT_PROVIDER)
+
+
+def _provider_label(provider: str) -> str:
+    return "Claude" if provider == CLAUDE_PROVIDER else "Codex"
 
 
 def _window_candidates(usage: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
@@ -465,7 +509,9 @@ def _optional_string(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
-def _parse_quota_window(window: Dict[str, Any]) -> Tuple[Optional[QuotaWindow], Optional[str]]:
+def _parse_quota_window(
+    window: Dict[str, Any], provider: str = DEFAULT_PROVIDER,
+) -> Tuple[Optional[QuotaWindow], Optional[str]]:
     used = _percent(window.get("usedPercent"))
     resets_at = parse_timestamp(window.get("resetsAt"))
     window_minutes = _window_minutes(window.get("windowMinutes"))
@@ -488,19 +534,20 @@ def _parse_quota_window(window: Dict[str, Any]) -> Tuple[Optional[QuotaWindow], 
             source_slot=_optional_string(window.get("sourceSlot")),
             is_default_limit=window.get("isDefaultLimit") is not False,
             rate_limit_reached_type=_optional_string(window.get("rateLimitReachedType")),
+            provider=provider,
         ),
         None,
     )
 
 
 def _parse_quota_windows(
-    usage: Dict[str, Any],
+    usage: Dict[str, Any], provider: str = DEFAULT_PROVIDER,
 ) -> Tuple[List[QuotaWindow], List[Tuple[str, bool, str]]]:
     windows: List[QuotaWindow] = []
     errors: List[Tuple[str, bool, str]] = []
     identities = set()
     for candidate in _window_candidates(usage):
-        window, error = _parse_quota_window(candidate)
+        window, error = _parse_quota_window(candidate, provider)
         if error or window is None:
             errors.append(
                 (
@@ -606,7 +653,8 @@ def _window_reason(window: QuotaWindow) -> str:
         else "unknown-duration"
     )
     bucket = f" ({window.limit_id})" if window.limit_id else ""
-    return f"{window.used_percent}% of the {duration} Codex quota{bucket} is used"
+    label = _provider_label(window.provider)
+    return f"{window.used_percent}% of the {duration} {label} quota{bucket} is used"
 
 
 def _blocked_decision(
@@ -662,11 +710,12 @@ def parse_codex_usage(
     reset_buffer_seconds: int = DEFAULT_RESET_BUFFER_SECONDS,
     now: Optional[datetime] = None,
     quota_config: Optional[QuotaConfig] = None,
+    provider: str = DEFAULT_PROVIDER,
 ) -> QuotaDecision:
     current_time = now or utc_now()
     config = quota_config or QuotaConfig()
     weekly_hard_block_enabled = config.weekly_mode == WEEKLY_MODE_HARD_BLOCK
-    entry = _codex_entry(payload)
+    entry = _provider_entry(payload, provider)
     if not entry:
         return QuotaDecision(
             status="unknown",
@@ -713,7 +762,7 @@ def parse_codex_usage(
         "spend_control_reached": spend_control_reached,
         "rate_limit_reached_type": rate_limit_reached_type,
     }
-    quota_windows, window_errors = _parse_quota_windows(usage)
+    quota_windows, window_errors = _parse_quota_windows(usage, provider)
     blocking_policy_error_entries = [
         (kind, error)
         for kind, is_default_limit, error in window_errors
@@ -758,6 +807,7 @@ def parse_codex_usage(
             name=WINDOW_KIND_ACCOUNT, used_percent=100, window_minutes=None,
             resets_at=account_reset, kind=WINDOW_KIND_ACCOUNT,
             limit_id=canonical_limit_id, rate_limit_reached_type=reason,
+            provider=provider,
         ) for reason in reasons]
 
     blocked_candidates: List[Tuple[str, QuotaWindow]] = []
@@ -964,6 +1014,8 @@ def _blocked_latch_from_window(
 def _normalized_source(source: Optional[str]) -> Optional[str]:
     if source == CODEX_APP_SERVER_SOURCE:
         return CODEX_APP_SERVER_SOURCE
+    if source == CLAUDE_USAGE_API_SOURCE:
+        return CLAUDE_USAGE_API_SOURCE
     if source in {CODEXBAR_SOURCE, "codex-cli"}:
         return CODEXBAR_SOURCE
     return source
@@ -971,7 +1023,7 @@ def _normalized_source(source: Optional[str]) -> Optional[str]:
 
 def _source_authority(source: Optional[str]) -> int:
     normalized = _normalized_source(source)
-    if normalized == CODEX_APP_SERVER_SOURCE:
+    if normalized in {CODEX_APP_SERVER_SOURCE, CLAUDE_USAGE_API_SOURCE}:
         return 2
     if normalized == CODEXBAR_SOURCE:
         return 1
@@ -1174,6 +1226,7 @@ def state_from_decision(
     previous_state: Optional[Dict[str, Any]] = None,
     threshold_percent: int = DEFAULT_THRESHOLD_PERCENT,
     weekly_threshold_percent: int = DEFAULT_WEEKLY_THRESHOLD_PERCENT,
+    provider: str = DEFAULT_PROVIDER,
 ) -> Dict[str, Any]:
     current_time = now or utc_now()
     short_term_state = _window_state(decision.short_term_window)
@@ -1223,6 +1276,9 @@ def state_from_decision(
             "weeklyThresholdPercent": weekly_threshold_percent,
         },
     }
+    # Codex state keeps its original shape; other providers record themselves.
+    if provider != DEFAULT_PROVIDER:
+        payload["provider"] = provider
 
     enforcement_windows = _merged_enforcement_windows(
         previous_state or {},
@@ -1269,6 +1325,7 @@ def write_state(
     *,
     threshold_percent: int = DEFAULT_THRESHOLD_PERCENT,
     weekly_threshold_percent: int = DEFAULT_WEEKLY_THRESHOLD_PERCENT,
+    provider: str = DEFAULT_PROVIDER,
 ) -> None:
     with _state_write_lock(path):
         previous_state = read_state(path)
@@ -1278,6 +1335,7 @@ def write_state(
             previous_state=previous_state,
             threshold_percent=threshold_percent,
             weekly_threshold_percent=weekly_threshold_percent,
+            provider=provider,
         )
         write_json_atomic(path, payload)
 
@@ -1299,6 +1357,9 @@ def cached_observation(
     threshold_percent: Optional[int] = None,
 ) -> Optional[QuotaDecision]:
     """Recover a source decision, not an effective open flag, for latch merging."""
+    provider = state.get("provider", DEFAULT_PROVIDER)
+    if not isinstance(provider, str) or provider not in PROVIDERS:
+        return None
     snapshot = state.get("observation")
     if (type(state.get("schemaVersion")) is not int or state.get("schemaVersion") != 5
             or not isinstance(snapshot, dict)
@@ -1325,7 +1386,7 @@ def cached_observation(
                 WINDOW_KIND_LONG_TERM, WINDOW_KIND_UNKNOWN} for kind in uncertain)):
         return None
     for window in windows:
-        parsed, error = _parse_quota_window(window)
+        parsed, error = _parse_quota_window(window, provider)
         if error or parsed is None or parsed.kind != window.get("kind"):
             return None
         if not isinstance(window.get("isDefaultLimit"), bool):
@@ -1355,7 +1416,7 @@ def cached_observation(
         usage["rateLimitReachedType"] = reached
     if snapshot.get("spendControlReached") is not None:
         usage["spendControlReached"] = snapshot["spendControlReached"]
-    payload = [{"provider": DEFAULT_PROVIDER, "source": source,
+    payload = [{"provider": provider, "source": source,
                 "sourceContext": context, "usage": usage}]
     try:
         decision = parse_codex_usage(
@@ -1367,6 +1428,7 @@ def cached_observation(
                              else WEEKLY_MODE_ADVISORY),
                 weekly_threshold_percent=snapshot["weeklyThresholdPercent"],
             ),
+            provider=provider,
         )
         if decision.status != snapshot["status"]:
             return None
@@ -1380,6 +1442,7 @@ def cached_observation(
                     weekly_mode=(WEEKLY_MODE_HARD_BLOCK if snapshot["weeklyHardBlockEnabled"]
                                  else WEEKLY_MODE_ADVISORY),
                     weekly_threshold_percent=snapshot["weeklyThresholdPercent"]),
+                provider=provider,
             )
     except (TypeError, ValueError, OverflowError):
         return None
@@ -1774,6 +1837,448 @@ def fetch_codex_usage(source: str = DEFAULT_USAGE_SOURCE) -> Any:
     raise ValueError(f"unsupported quota source: {source}")
 
 
+def claude_usage_to_usage(result: Any, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """Normalize Anthropic's plan-usage response into Quota Sentry's usage payload."""
+    if not isinstance(result, dict):
+        raise ValueError("Claude usage response was not a JSON object")
+    observed = format_timestamp(now or utc_now())
+    defaults = dict(CLAUDE_DEFAULT_WINDOWS)
+    windows: List[Dict[str, Any]] = []
+    for name, value in result.items():
+        if not isinstance(value, dict) or "utilization" not in value:
+            continue
+        if name in defaults:
+            minutes, is_default = defaults[name], True
+        elif name.startswith("seven_day_"):
+            # Model- or surface-scoped weekly rows never gate all Claude work.
+            minutes, is_default = DEFAULT_WEEKLY_WINDOW_MINUTES, False
+        else:
+            continue
+        resets_at = value.get("resets_at")
+        if resets_at is None:
+            # Claude reports no reset time for a window that has not started;
+            # its utilization is still the current reading.
+            resets_at = observed
+        windows.append({
+            "usedPercent": value.get("utilization"),
+            "windowMinutes": minutes,
+            "resetsAt": resets_at,
+            "sourceSlot": name,
+            "limitId": name,
+            "isDefaultLimit": is_default,
+        })
+    return [{
+        "provider": CLAUDE_PROVIDER,
+        "source": CLAUDE_USAGE_API_SOURCE,
+        "usage": {"updatedAt": observed, "activeLimitId": None, "windows": windows},
+    }]
+
+
+def claude_config_dir(environ: Optional[Dict[str, str]] = None) -> Path:
+    env = os.environ if environ is None else environ
+    configured = env.get("CLAUDE_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def claude_credentials_path(environ: Optional[Dict[str, str]] = None) -> Path:
+    """Quota Sentry's own Claude sign-in file. Claude Code's login is never read."""
+    env = os.environ if environ is None else environ
+    root = env.get("XDG_CONFIG_HOME")
+    base = Path(root) / "quota-sentry" if root else Path.home() / ".config" / "quota-sentry"
+    return base / CLAUDE_CREDENTIALS_FILENAME
+
+
+def read_claude_credentials(
+    *, environ: Optional[Dict[str, str]] = None, path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Read Quota Sentry's own Claude sign-in file. Never reads the Keychain."""
+    login_path = path or claude_credentials_path(environ)
+    try:
+        text = login_path.read_text()
+    except FileNotFoundError:
+        raise RuntimeError(
+            "no Quota Sentry Claude sign-in; run `quota-sentry login --provider claude`")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"could not read the Quota Sentry Claude sign-in ({type(exc).__name__})")
+    try:
+        stored = json.loads(text.strip())
+    except (ValueError, RecursionError):
+        raise RuntimeError("the Quota Sentry Claude sign-in file is not readable JSON")
+    if not isinstance(stored, dict):
+        raise RuntimeError("the Quota Sentry Claude sign-in file is not a JSON object")
+    return stored
+
+
+def write_claude_credentials(path: Path, stored: Dict[str, Any]) -> None:
+    """Atomically write the sign-in file, readable only by its owner."""
+    write_bytes_atomic(path, (json.dumps(stored, indent=2) + "\n").encode("utf-8"), mode=0o600)
+
+
+def _claude_oauth(stored: Any) -> Dict[str, Any]:
+    oauth = stored.get("claudeAiOauth") if isinstance(stored, dict) else None
+    return oauth if isinstance(oauth, dict) else {}
+
+
+def claude_access_token(stored: Any, now: Optional[datetime] = None) -> str:
+    oauth = stored.get("claudeAiOauth") if isinstance(stored, dict) else None
+    if not isinstance(oauth, dict):
+        raise RuntimeError("the Claude sign-in has no claude.ai login")
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("the Claude sign-in has no access token")
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+        if expires_at / 1000 <= (now or utc_now()).timestamp():
+            raise RuntimeError("the Claude sign-in token has expired and was not renewed")
+    scopes = oauth.get("scopes")
+    if isinstance(scopes, list) and "user:profile" not in scopes:
+        raise RuntimeError("the Claude sign-in lacks the user:profile scope")
+    return token
+
+
+def _loopback_override(env: Dict[str, str], name: str, default: str) -> str:
+    override = env.get(name)
+    if not override:
+        return default
+    host = urllib.parse.urlparse(override).hostname or ""
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ValueError(f"{name} must point to a loopback address")
+    return override
+
+
+def claude_usage_url(environ: Optional[Dict[str, str]] = None) -> str:
+    env = os.environ if environ is None else environ
+    return _loopback_override(env, CLAUDE_USAGE_URL_OVERRIDE_ENV, CLAUDE_USAGE_URL)
+
+
+def claude_token_url(environ: Optional[Dict[str, str]] = None) -> str:
+    env = os.environ if environ is None else environ
+    return _loopback_override(env, CLAUDE_TOKEN_URL_OVERRIDE_ENV, CLAUDE_OAUTH_TOKEN_URL)
+
+
+def claude_oauth_start() -> Dict[str, str]:
+    """Build a PKCE sign-in link whose final page shows a code to paste back."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+    state = secrets.token_urlsafe(32)
+    query = urllib.parse.urlencode([
+        ("code", "true"),
+        ("client_id", CLAUDE_OAUTH_CLIENT_ID),
+        ("response_type", "code"),
+        ("redirect_uri", CLAUDE_OAUTH_REDIRECT_URL),
+        ("scope", " ".join(CLAUDE_OAUTH_SCOPES)),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("state", state),
+    ], quote_via=urllib.parse.quote)
+    return {"url": f"{CLAUDE_OAUTH_AUTHORIZE_URL}?{query}", "verifier": verifier, "state": state}
+
+
+class ClaudeSignInRejected(RuntimeError):
+    """Anthropic refused the sign-in or its renewal; a new login is needed."""
+
+
+class ClaudeRateLimited(RuntimeError):
+    def __init__(self, message: str, retry_after: Optional[str] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _claude_token_request(
+    body: Dict[str, Any], *, environ: Optional[Dict[str, str]], timeout_seconds: int,
+) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        claude_token_url(environ), method="POST", data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "User-Agent": "quota-sentry"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        status = error.code
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        error.close()
+        if status == 429:
+            raise ClaudeRateLimited("Claude sign-in endpoint rate-limited Quota Sentry",
+                                    retry_after)
+        if status in {400, 401, 403}:
+            raise ClaudeSignInRejected(
+                f"Anthropic refused the Quota Sentry Claude sign-in (HTTP {status}); "
+                "run `quota-sentry login --provider claude` again")
+        raise RuntimeError(f"Claude sign-in endpoint returned HTTP {status}")
+    except (urllib.error.URLError, OSError) as error:
+        reason = getattr(error, "reason", error)
+        raise RuntimeError(f"Claude sign-in endpoint unreachable ({type(reason).__name__})")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        raise RuntimeError("Claude sign-in endpoint returned unreadable JSON")
+    if not isinstance(payload, dict) or not isinstance(payload.get("access_token"), str) \
+            or not payload["access_token"]:
+        raise RuntimeError("Claude sign-in endpoint returned no access token")
+    return payload
+
+
+def _stored_from_token_response(
+    payload: Dict[str, Any], *, previous_refresh: Optional[str],
+    requested_scopes: Iterable[str], now: datetime,
+) -> Dict[str, Any]:
+    expires_in = payload.get("expires_in")
+    expires_at = None
+    if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+        expires_at = int((now.timestamp() + expires_in) * 1000)
+    scope = payload.get("scope")
+    scopes = scope.split() if isinstance(scope, str) and scope.strip() else list(requested_scopes)
+    refresh = payload.get("refresh_token")
+    if not isinstance(refresh, str) or not refresh:
+        refresh = previous_refresh
+    return {"claudeAiOauth": {"accessToken": payload["access_token"], "refreshToken": refresh,
+                              "expiresAt": expires_at, "scopes": scopes}}
+
+
+def claude_oauth_exchange(
+    pasted: str, *, verifier: str, state: str, environ: Optional[Dict[str, str]] = None,
+    now: Optional[datetime] = None, timeout_seconds: int = DEFAULT_CLAUDE_USAGE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Exchange the code shown after sign-in (`code#state`) for a Quota Sentry login."""
+    code, separator, pasted_state = (pasted or "").strip().partition("#")
+    if not code or not separator or not pasted_state:
+        raise RuntimeError("that is not the full code; copy all of it, including the # in the middle")
+    if not secrets.compare_digest(pasted_state, state):
+        raise RuntimeError("that code does not match this sign-in; start `quota-sentry login` again")
+    payload = _claude_token_request({
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": CLAUDE_OAUTH_REDIRECT_URL, "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        "code_verifier": verifier, "state": state,
+    }, environ=environ, timeout_seconds=timeout_seconds)
+    return _stored_from_token_response(payload, previous_refresh=None,
+                                       requested_scopes=CLAUDE_OAUTH_SCOPES,
+                                       now=now or utc_now())
+
+
+def renew_claude_login(
+    stored: Dict[str, Any], *, environ: Optional[Dict[str, str]] = None,
+    now: Optional[datetime] = None, timeout_seconds: int = DEFAULT_CLAUDE_USAGE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    oauth = _claude_oauth(stored)
+    refresh = oauth.get("refreshToken")
+    if not isinstance(refresh, str) or not refresh:
+        raise ClaudeSignInRejected(
+            "the Quota Sentry Claude sign-in cannot be renewed; "
+            "run `quota-sentry login --provider claude` again")
+    scopes = oauth.get("scopes")
+    scopes = [item for item in scopes if isinstance(item, str)] if isinstance(scopes, list) else []
+    scopes = scopes or list(CLAUDE_OAUTH_SCOPES)
+    payload = _claude_token_request({
+        "grant_type": "refresh_token", "refresh_token": refresh,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID, "scope": " ".join(scopes),
+    }, environ=environ, timeout_seconds=timeout_seconds)
+    return _stored_from_token_response(payload, previous_refresh=refresh,
+                                       requested_scopes=scopes, now=now or utc_now())
+
+
+def _claude_login_fingerprint(stored: Any) -> str:
+    token = _claude_oauth(stored).get("accessToken")
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:16]
+
+
+def _claude_needs_renewal(stored: Any, now: datetime) -> bool:
+    expires_at = _claude_oauth(stored).get("expiresAt")
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+        return False
+    return expires_at / 1000 - now.timestamp() <= CLAUDE_TOKEN_RENEW_MARGIN_SECONDS
+
+
+@contextmanager
+def _claude_login_lock(path: Path):
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _renew_and_save_claude_login(
+    path: Path, seen: Dict[str, Any], *, force: bool, environ: Optional[Dict[str, str]],
+    now: datetime, timeout_seconds: int,
+) -> Dict[str, Any]:
+    with _claude_login_lock(path):
+        latest = read_claude_credentials(path=path)
+        if _claude_login_fingerprint(latest) != _claude_login_fingerprint(seen):
+            return latest  # Another Quota Sentry process already renewed or re-signed-in.
+        if not force and not _claude_needs_renewal(latest, now):
+            return latest
+        renewed = renew_claude_login(latest, environ=environ, now=now,
+                                     timeout_seconds=timeout_seconds)
+        write_claude_credentials(path, renewed)
+        return renewed
+
+
+def _claude_usage_hold_path(state_dir: Optional[Path]) -> Optional[Path]:
+    return state_dir / CLAUDE_USAGE_HOLD_FILENAME if state_dir is not None else None
+
+
+def read_claude_usage_hold(state_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
+    path = _claude_usage_hold_path(state_dir)
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    until = parse_timestamp(payload.get("until")) if isinstance(payload, dict) else None
+    if until is None or not isinstance(payload.get("login"), str):
+        return None
+    return {"until": until, "kind": payload.get("kind"), "login": payload["login"]}
+
+
+def _write_claude_usage_hold(state_dir: Optional[Path], *, until: datetime, kind: str,
+                             login: str) -> None:
+    path = _claude_usage_hold_path(state_dir)
+    if path is None:
+        return
+    try:
+        write_json_atomic(path, {"until": format_timestamp(until), "kind": kind, "login": login})
+    except OSError:
+        pass
+
+
+def _claude_rate_limit_hold_seconds(retry_after: Optional[str]) -> int:
+    try:
+        seconds = int(str(retry_after).strip())
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds <= 0:
+        seconds = CLAUDE_RATE_LIMIT_HOLD_DEFAULT_SECONDS
+    return min(seconds, CLAUDE_RATE_LIMIT_HOLD_MAX_SECONDS)
+
+
+def _claude_usage_get(url: str, token: str, timeout_seconds: int) -> bytes:
+    request = urllib.request.Request(url, method="GET", headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": CLAUDE_OAUTH_BETA,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "quota-sentry",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        status = error.code
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        error.close()
+        if status in {403, 429}:
+            raise ClaudeRateLimited(f"Claude usage endpoint answered HTTP {status}", retry_after)
+        if status == 401:
+            raise ClaudeSignInRejected("Anthropic rejected the Quota Sentry Claude sign-in (HTTP 401)")
+        raise RuntimeError(f"Claude usage endpoint returned HTTP {status}")
+    except (urllib.error.URLError, OSError) as error:
+        reason = getattr(error, "reason", error)
+        raise RuntimeError(f"Claude usage endpoint unreachable ({type(reason).__name__})")
+
+
+def fetch_claude_usage_api(
+    *,
+    state_dir: Optional[Path] = None,
+    now: Optional[datetime] = None,
+    environ: Optional[Dict[str, str]] = None,
+    credentials_path: Optional[Path] = None,
+    timeout_seconds: int = DEFAULT_CLAUDE_USAGE_TIMEOUT_SECONDS,
+) -> List[Dict[str, Any]]:
+    """Read Claude plan usage from Anthropic with Quota Sentry's own sign-in."""
+    current_time = now or utc_now()
+    url = claude_usage_url(environ)
+    path = credentials_path or claude_credentials_path(environ)
+    stored = read_claude_credentials(path=path)
+    hold = read_claude_usage_hold(state_dir)
+    if (hold is not None and current_time < hold["until"]
+            and hold["login"] == _claude_login_fingerprint(stored)):
+        if hold["kind"] == "auth_rejected":
+            raise RuntimeError(
+                "Anthropic rejected the Quota Sentry Claude sign-in; not asking again until "
+                f"{format_timestamp(hold['until'])} unless you run `quota-sentry login --provider claude`")
+        raise RuntimeError(
+            f"Claude usage endpoint rate-limited Quota Sentry until {format_timestamp(hold['until'])}")
+
+    def hold_for(kind: str, seconds: int, login: Dict[str, Any]) -> datetime:
+        until = current_time + timedelta(seconds=seconds)
+        _write_claude_usage_hold(state_dir, until=until, kind=kind,
+                                 login=_claude_login_fingerprint(login))
+        return until
+
+    renewed = False
+    try:
+        if _claude_needs_renewal(stored, current_time):
+            stored = _renew_and_save_claude_login(path, stored, force=False, environ=environ,
+                                                  now=current_time, timeout_seconds=timeout_seconds)
+            renewed = True
+        token = claude_access_token(stored, now=current_time)
+        try:
+            body = _claude_usage_get(url, token, timeout_seconds)
+        except ClaudeSignInRejected:
+            if renewed:
+                raise
+            stored = _renew_and_save_claude_login(path, stored, force=True, environ=environ,
+                                                  now=current_time, timeout_seconds=timeout_seconds)
+            body = _claude_usage_get(url, claude_access_token(stored, now=current_time),
+                                     timeout_seconds)
+    except ClaudeRateLimited as limited:
+        until = hold_for("rate_limited", _claude_rate_limit_hold_seconds(limited.retry_after),
+                         stored)
+        raise RuntimeError(f"{limited}; rate-limited until {format_timestamp(until)}")
+    except ClaudeSignInRejected as rejected:
+        # `stored` is the login that was last rejected (renewed or not).
+        hold_for("auth_rejected", CLAUDE_AUTH_REJECTED_HOLD_SECONDS, stored)
+        raise RuntimeError(str(rejected))
+    try:
+        result = json.loads(body.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        raise RuntimeError("Claude usage endpoint returned unreadable JSON")
+    return claude_usage_to_usage(result, now=current_time)
+
+
+def fetch_quota_usage(
+    provider: str = DEFAULT_PROVIDER,
+    source: str = DEFAULT_USAGE_SOURCE,
+    *,
+    state_dir: Optional[Path] = None,
+) -> Any:
+    if provider == CLAUDE_PROVIDER:
+        if source in {AUTO_SOURCE, CLAUDE_USAGE_API_SOURCE}:
+            return fetch_claude_usage_api(state_dir=state_dir)
+        raise ValueError(f"unsupported Claude quota source: {source}")
+    return fetch_codex_usage(source=source)
+
+
+def _source_context(provider: str, decision: QuotaDecision, config_path: Optional[Path]) -> str:
+    config = str((config_path or default_config_path()).expanduser().resolve())
+    if provider == CLAUDE_PROVIDER:
+        context = {
+            "claudeLogin": str(claude_credentials_path().expanduser().resolve()),
+            "config": config,
+            "source": _normalized_source(decision.source),
+        }
+    else:
+        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+        context = {
+            "codexHome": str(codex_home.expanduser().resolve()),
+            "config": config,
+            "source": _normalized_source(decision.source),
+        }
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def poll_once(
     state_path: Path,
     threshold_percent: int = DEFAULT_THRESHOLD_PERCENT,
@@ -1783,27 +2288,23 @@ def poll_once(
     config_path: Optional[Path] = None,
     quota_config: Optional[QuotaConfig] = None,
     now: Optional[datetime] = None,
+    provider: str = DEFAULT_PROVIDER,
 ) -> QuotaDecision:
     current_time = now or utc_now()
     active_config = (quota_config or read_valid_config(config_path)
                      or _retained_policy_config(read_state(state_path)))
     try:
-        payload = fetcher() if fetcher is not None else fetch_codex_usage(source=source)
+        payload = (fetcher() if fetcher is not None
+                   else fetch_quota_usage(provider, source, state_dir=state_path.parent))
         decision = parse_codex_usage(
             payload,
             threshold_percent=threshold_percent,
             reset_buffer_seconds=reset_buffer_seconds,
             now=current_time,
             quota_config=active_config,
+            provider=provider,
         )
-        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-        context = {
-            "codexHome": str(codex_home.expanduser().resolve()),
-            "config": str((config_path or default_config_path()).expanduser().resolve()),
-            "source": _normalized_source(decision.source),
-        }
-        decision = replace(decision, source_context=hashlib.sha256(
-            json.dumps(context, sort_keys=True).encode("utf-8")).hexdigest())
+        decision = replace(decision, source_context=_source_context(provider, decision, config_path))
     except Exception as exc:
         decision = QuotaDecision(
             status="unknown",
@@ -1818,6 +2319,7 @@ def poll_once(
         now=current_time,
         threshold_percent=threshold_percent,
         weekly_threshold_percent=active_config.weekly_threshold_percent,
+        provider=provider,
     )
     return decision
 
@@ -2021,10 +2523,12 @@ def wait_if_blocked(
                 return fail_closed_exit_code
             seconds = min(seconds, remaining_guard_seconds)
         if notify and not emitted_notice:
-            notice(f"Quota Sentry: waiting for Codex quota reset until {format_timestamp(block_until)}.")
+            label = _provider_label(state.get("provider", DEFAULT_PROVIDER))
+            notice(f"Quota Sentry: waiting for {label} quota reset until {format_timestamp(block_until)}.")
             emitted_notice = True
         if verbose and not emitted_wait_message:
-            output(f"Quota Sentry: Codex quota guard active until {format_timestamp(block_until)}.")
+            label = _provider_label(state.get("provider", DEFAULT_PROVIDER))
+            output(f"Quota Sentry: {label} quota guard active until {format_timestamp(block_until)}.")
             emitted_wait_message = True
         sleeper(seconds)
 
@@ -2135,6 +2639,113 @@ def merge_codex_hooks(existing: Dict[str, Any], script_path: Path,
         hooks[event_name] = _remove_existing_quota_sentry(current_entries, script_path) + [entry]
 
     return merged
+
+
+CLAUDE_HOOK_STATUS_MESSAGE = "Quota Sentry: quota checkpoint"
+CLAUDE_SESSION_START_TIMEOUT_SECONDS = 30
+CLAUDE_HOOK_MATCHERS = {
+    "SessionStart": "startup|resume|clear|compact",
+    "UserPromptSubmit": None,
+    "PreToolUse": "*",
+    "PostToolUse": "*",
+    # PostToolBatch runs once per tool batch, before Claude's next model request.
+    "PostToolBatch": None,
+    "PreCompact": None,
+}
+
+
+def claude_quota_sentry_hook_args() -> Dict[str, List[str]]:
+    provider = ["--provider", CLAUDE_PROVIDER]
+    cached_guard = ["guard", "--state-only", "--no-notify", "--read-hook-input",
+                    "--hook-mode", "--recover-daemon", *provider]
+    return {
+        "SessionStart": ["start", "--quiet", "--read-hook-input", *provider],
+        "UserPromptSubmit": ["prompt-guard", "--read-hook-input", "--hook-mode",
+                             "--recover-daemon", *provider],
+        "PreToolUse": cached_guard,
+        "PostToolUse": list(cached_guard),
+        "PostToolBatch": list(cached_guard),
+        "PreCompact": list(cached_guard),
+    }
+
+
+def _is_claude_quota_sentry_hook(hook: Any, script_path: Path) -> bool:
+    command = hook.get("command") if isinstance(hook, dict) else None
+    if not isinstance(command, str) or not command:
+        return False
+    if "args" in hook:
+        program = command
+    else:
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            return False
+        if not words:
+            return False
+        program = words[0]
+    return Path(program).name == "quota-sentry" or program == str(script_path)
+
+
+def merge_claude_hooks(existing: Dict[str, Any], script_path: Path,
+                       notify_on_block: bool = True) -> Dict[str, Any]:
+    """Merge Quota Sentry hooks into Claude Code settings, leaving everything else intact."""
+    merged = json.loads(json.dumps(existing or {}))
+    hooks = merged.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        merged["hooks"] = hooks
+    for event_name, args in claude_quota_sentry_hook_args().items():
+        hook: Dict[str, Any] = {"type": "command", "command": str(script_path), "args": args}
+        if event_name == "SessionStart":
+            hook["timeout"] = CLAUDE_SESSION_START_TIMEOUT_SECONDS
+        else:
+            hook["timeout"] = DEFAULT_HOOK_TIMEOUT_SECONDS
+            if notify_on_block:
+                hook["statusMessage"] = CLAUDE_HOOK_STATUS_MESSAGE
+        entry: Dict[str, Any] = {}
+        if CLAUDE_HOOK_MATCHERS[event_name] is not None:
+            entry["matcher"] = CLAUDE_HOOK_MATCHERS[event_name]
+        entry["hooks"] = [hook]
+
+        current_entries = hooks.get(event_name)
+        if not isinstance(current_entries, list):
+            current_entries = []
+        kept = []
+        for current in current_entries:
+            entry_hooks = current.get("hooks") if isinstance(current, dict) else None
+            if not isinstance(entry_hooks, list):
+                kept.append(current)
+                continue
+            remaining = [item for item in entry_hooks
+                         if not _is_claude_quota_sentry_hook(item, script_path)]
+            if len(remaining) == len(entry_hooks):
+                kept.append(current)
+            elif remaining:
+                kept.append({**current, "hooks": remaining})
+        hooks[event_name] = kept + [entry]
+    return merged
+
+
+def claude_hooks_installed(settings: Any, script_path: Path, notify_on_block: bool = True) -> bool:
+    """Check that exactly one expected Quota Sentry hook exists for every Claude event."""
+    expected = merge_claude_hooks({}, script_path, notify_on_block=notify_on_block)["hooks"]
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    if not isinstance(hooks, dict):
+        return False
+    for event_name, [entry] in expected.items():
+        found = [
+            (current, item)
+            for current in hooks.get(event_name) or []
+            if isinstance(current, dict) and isinstance(current.get("hooks"), list)
+            for item in current["hooks"]
+            if _is_claude_quota_sentry_hook(item, script_path)
+        ]
+        if len(found) != 1:
+            return False
+        current, item = found[0]
+        if item != entry["hooks"][0] or current.get("matcher") != entry.get("matcher"):
+            return False
+    return True
 
 
 def _exact_quota_sentry_hook_metadata(

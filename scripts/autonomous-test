@@ -8,7 +8,8 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -53,7 +54,125 @@ SCENARIOS = [
     ("AT-021", "omitted backend state cannot clear latch"),
     ("AT-022", "ambiguous replacement buckets recover without denial"),
     ("AT-023", "adaptive daemon cadence and refresh wakeup"),
+    ("AT-024", "synthetic Claude usage poll"),
+    ("AT-025", "Claude daemon releases a parked hook only on a fresh reading"),
+    ("AT-026", "Claude source failures keep a block and never deny"),
+    ("AT-027", "Claude weekly hard-block and advisory model windows"),
+    ("AT-028", "Claude usage endpoint rate-limit back-off"),
+    ("AT-029", "Claude hook installer temp merge"),
+    ("AT-030", "Claude sign-in renews an expiring token"),
+    ("AT-031", "Claude login command stores a private sign-in"),
+    ("AT-032", "Claude daemon spaces reads despite refresh requests"),
 ]
+
+CLAUDE_HARNESS_TOKEN = "fake-access-token-HARNESS-ONLY"
+CLAUDE_HARNESS_RENEWED_TOKEN = "fake-renewed-token-HARNESS-ONLY"
+CLAUDE_HARNESS_CREDENTIALS = {"claudeAiOauth": {
+    "accessToken": CLAUDE_HARNESS_TOKEN,
+    "refreshToken": "harness-refresh-only",
+    "expiresAt": 4102444800000,
+    "scopes": ["user:inference", "user:profile"],
+    "subscriptionType": "pro",
+}}
+
+
+class _ClaudeUsageHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        server = self.server
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            body = None
+        with server.lock:
+            server.token_requests.append(body)
+            status, payload = server.token_reply
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode())
+
+    def do_GET(self):
+        server = self.server
+        with server.lock:
+            server.requests.append({
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+                "beta": self.headers.get("anthropic-beta"),
+            })
+            status, headers, body = server.reply
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        return
+
+
+class ClaudeUsageServer:
+    """Loopback stand-in for Anthropic's plan-usage endpoint."""
+
+    def __init__(self) -> None:
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _ClaudeUsageHandler)
+        self.httpd.lock = threading.Lock()
+        self.httpd.requests = []
+        self.httpd.token_requests = []
+        self.httpd.token_reply = (200, {"access_token": CLAUDE_HARNESS_RENEWED_TOKEN,
+                                        "refresh_token": "harness-refresh-renewed",
+                                        "expires_in": 28800, "scope": "user:profile"})
+        self.set_json(claude_body())
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/api/oauth/usage"
+        self.token_url = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1/oauth/token"
+
+    def set_json(self, body: Dict[str, object]) -> None:
+        self.set_reply(200, {"Content-Type": "application/json"}, json.dumps(body).encode())
+
+    def set_reply(self, status: int, headers: Dict[str, str], body: bytes) -> None:
+        with self.httpd.lock:
+            self.httpd.reply = (status, headers, body)
+
+    def token_requests(self) -> List[object]:
+        with self.httpd.lock:
+            return list(self.httpd.token_requests)
+
+    def request_count(self) -> int:
+        with self.httpd.lock:
+            return len(self.httpd.requests)
+
+    def last_request(self) -> Dict[str, object]:
+        with self.httpd.lock:
+            return dict(self.httpd.requests[-1])
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def claude_body(five: Optional[float] = 41, week: Optional[float] = 24, *,
+                five_reset_seconds: Optional[int] = 3600, week_reset_seconds: int = 86400,
+                extra: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    now = datetime.now(timezone.utc)
+
+    def reset(seconds: Optional[int]) -> Optional[str]:
+        return None if seconds is None else (now + timedelta(seconds=seconds)).isoformat()
+
+    body: Dict[str, object] = {
+        "five_hour": None if five is None else {"utilization": five,
+                                                "resets_at": reset(five_reset_seconds)},
+        "seven_day": None if week is None else {"utilization": week,
+                                                "resets_at": reset(week_reset_seconds)},
+        "seven_day_opus": None,
+        "seven_day_sonnet": None,
+        "extra_usage": {"is_enabled": False, "monthly_limit": None,
+                        "used_credits": None, "utilization": None},
+    }
+    if extra:
+        body.update(extra)
+    return body
 
 
 @dataclass
@@ -88,6 +207,57 @@ class Harness:
         self.fake_bin.mkdir(parents=True, exist_ok=True)
         self._write_fake_codex()
         self._write_fake_codexbar()
+        self.claude_login = run_dir / "config-home" / "quota-sentry" / "claude-credentials.json"
+        self.write_claude_login(CLAUDE_HARNESS_CREDENTIALS)
+        self.claude_server = ClaudeUsageServer()
+
+    def write_claude_login(self, stored: Dict[str, object]) -> None:
+        self.claude_login.parent.mkdir(parents=True, exist_ok=True)
+        self.claude_login.write_text(json.dumps(stored))
+        self.claude_login.chmod(0o600)
+
+    def claude_env(self, login: str = "ok") -> Dict[str, str]:
+        env = self.env()
+        env.pop("QUOTA_SENTRY_DISABLE", None)
+        env["QUOTA_SENTRY_CLAUDE_USAGE_URL"] = self.claude_server.url
+        env["QUOTA_SENTRY_CLAUDE_TOKEN_URL"] = self.claude_server.token_url
+        if login != "ok":
+            env["XDG_CONFIG_HOME"] = str(self.run_dir / f"config-home-{login}")
+        return env
+
+    def claude_poll(self, result: ScenarioResult, state_dir: Path,
+                    login: str = "ok") -> Dict[str, object]:
+        self.run(result, [str(QUOTA_SENTRY), "poll", "--provider", "claude",
+                          "--state-dir", str(state_dir)], env=self.claude_env(login))
+        return self.state(state_dir)
+
+    def claude_hook_guard(self, state_dir: Path, env: Dict[str, str]) -> subprocess.Popen:
+        process = subprocess.Popen(
+            [str(QUOTA_SENTRY), "guard", "--provider", "claude", "--state-dir", str(state_dir),
+             "--state-only", "--no-notify", "--read-hook-input", "--hook-mode",
+             "--interval-seconds", "1"],
+            cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        process.stdin.write(json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Bash"}))
+        process.stdin.close()
+        process.stdin = None  # already delivered; communicate() must not flush it again
+        return process
+
+    def wait_for_status(self, state_dir: Path, status: str,
+                        timeout_seconds: int = 12) -> Dict[str, object]:
+        deadline = time.monotonic() + timeout_seconds
+        state: Dict[str, object] = {}
+        while time.monotonic() < deadline:
+            path = state_dir / "state.json"
+            if path.exists():
+                try:
+                    state = json.loads(path.read_text())
+                except ValueError:
+                    state = {}
+                if state.get("status") == status:
+                    return state
+            time.sleep(0.2)
+        raise AutonomousTestError(f"state never became {status!r}: {state}")
 
     def _write_fake_codex(self) -> None:
         script = self.fake_bin / "codex"
@@ -1499,6 +1669,249 @@ print(json.dumps(payload))
             "cadence, and a coalesced refresh request woke the weekly daemon early."
         )
 
+    def scenario_claude_usage_poll(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "claude-poll"
+        self.claude_server.set_json(claude_body(41, 24))
+        state = self.claude_poll(result, state_dir)
+        if (state.get("status"), state.get("provider"), state.get("source")) != (
+                "open", "claude", "claude-usage-api"):
+            raise AutonomousTestError(f"unexpected Claude state: {state}")
+        kinds = {window.get("limitId"): window.get("windowMinutes")
+                 for window in state.get("windows", [])}
+        if kinds != {"five_hour": 300, "seven_day": 10080}:
+            raise AutonomousTestError(f"Claude windows were not classified by name: {kinds}")
+        request = self.claude_server.last_request()
+        if request.get("authorization") != f"Bearer {CLAUDE_HARNESS_TOKEN}":
+            raise AutonomousTestError("usage request did not carry the stored Claude login")
+        if request.get("beta") != "oauth-2025-04-20":
+            raise AutonomousTestError(f"usage request beta header was {request.get('beta')!r}")
+        result.notes.append("Poll read 5h/weekly windows from the loopback endpoint with the fake stored login.")
+
+    def scenario_claude_daemon_releases_parked_hook(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "claude-daemon-park"
+        env = self.claude_env()
+        self.claude_server.set_json(claude_body(95, 24))
+        self.run(result, [str(QUOTA_SENTRY), "start", "--provider", "claude",
+                          "--state-dir", str(state_dir), "--interval-seconds", "1",
+                          "--near-interval-seconds", "1", "--critical-interval-seconds", "1",
+                          "--min-poll-spacing-seconds", "1"],
+                 env=env)
+        guard = None
+        try:
+            self.wait_for_status(state_dir, "blocked")
+            guard = self.claude_hook_guard(state_dir, env)
+            time.sleep(2.5)
+            if guard.poll() is not None:
+                raise AutonomousTestError("hook released while the 5h window was at 95%")
+            self.claude_server.set_reply(500, {}, b"")
+            time.sleep(2.5)
+            if guard.poll() is not None:
+                raise AutonomousTestError("hook released on a source outage during a confirmed block")
+            requests_while_parked = self.claude_server.request_count()
+            self.claude_server.set_json(claude_body(0, 24, five_reset_seconds=None))
+            stdout, stderr = guard.communicate(timeout=20)
+            if guard.returncode != 0:
+                raise AutonomousTestError(f"released hook exited {guard.returncode}")
+            if stdout.strip() or stderr.strip():
+                raise AutonomousTestError(f"hook was not quiet: {stdout!r} {stderr!r}")
+            state = self.state(state_dir)
+            if state.get("status") != "open":
+                raise AutonomousTestError(f"daemon did not clear the block: {state}")
+            result.notes.append(
+                f"Hook stayed parked through 95% and an HTTP 500; daemon made "
+                f"{requests_while_parked} endpoint reads; a fresh 0% reading released it quietly.")
+        finally:
+            if guard is not None and guard.poll() is None:
+                guard.kill()
+                guard.wait(timeout=5)
+            self.run(result, [str(QUOTA_SENTRY), "stop", "--provider", "claude",
+                              "--state-dir", str(state_dir)], env=env)
+
+    def scenario_claude_failures_keep_block_and_never_deny(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "claude-failures-blocked"
+        self.claude_server.set_json(claude_body(95, 24))
+        if self.claude_poll(result, state_dir).get("status") != "blocked":
+            raise AutonomousTestError("95% 5h reading did not block")
+        failures = [
+            ("HTTP 500", lambda: self.claude_server.set_reply(500, {}, b"")),
+            ("HTTP 401", lambda: self.claude_server.set_reply(401, {}, b'{"error":"x"}')),
+            ("unreadable JSON", lambda: self.claude_server.set_reply(
+                200, {"Content-Type": "application/json"}, b"not json")),
+        ]
+        for label, apply in failures:
+            apply()
+            state = self.claude_poll(result, state_dir)
+            if state.get("status") != "blocked" or state.get("sourceStatus") != "unknown":
+                raise AutonomousTestError(f"{label} changed a confirmed block: {state}")
+        self.claude_server.set_json(claude_body(20, 24))
+        state = self.claude_poll(result, state_dir, login="missing")
+        if state.get("status") != "blocked":
+            raise AutonomousTestError(f"missing login released a confirmed block: {state}")
+
+        open_dir = self.run_dir / "claude-failures-unlatched"
+        self.claude_server.set_reply(500, {}, b"")
+        if self.claude_poll(result, open_dir).get("status") != "unknown":
+            raise AutonomousTestError("source outage without a block was not unknown")
+        started = time.monotonic()
+        guard = self.claude_hook_guard(open_dir, self.claude_env())
+        stdout, stderr = guard.communicate(timeout=10)
+        if guard.returncode != 0 or stdout.strip() or stderr.strip():
+            raise AutonomousTestError(
+                f"unlatched outage was denied or noisy: {guard.returncode} {stdout!r} {stderr!r}")
+        result.notes.append(
+            f"500/401/bad JSON/missing login kept the block; unlatched outage continued in "
+            f"{time.monotonic() - started:.2f}s with no output.")
+
+    def scenario_claude_weekly_and_advisory_windows(self, result: ScenarioResult) -> None:
+        self.claude_server.set_json(claude_body(10, 99))
+        state = self.claude_poll(result, self.run_dir / "claude-weekly")
+        if (state.get("status"), state.get("blockedWindow")) != ("blocked", "weekly"):
+            raise AutonomousTestError(f"weekly 99% did not hard-block: {state}")
+        week_reset = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        self.claude_server.set_json(claude_body(10, 20, extra={
+            "seven_day_opus": {"utilization": 100, "resets_at": week_reset}}))
+        state = self.claude_poll(result, self.run_dir / "claude-advisory")
+        if state.get("status") != "open":
+            raise AutonomousTestError(f"model-scoped weekly row blocked all work: {state}")
+        result.notes.append("Weekly 99% blocked; a 100% Opus-only weekly row stayed advisory.")
+
+    def scenario_claude_rate_limit_back_off(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "claude-rate-limited"
+        self.claude_server.set_reply(429, {"Retry-After": "120"}, b"")
+        before = self.claude_server.request_count()
+        first = self.claude_poll(result, state_dir)
+        second = self.claude_poll(result, state_dir)
+        asked = self.claude_server.request_count() - before
+        if asked != 1:
+            raise AutonomousTestError(f"endpoint was asked {asked} times during a 429 hold")
+        if first.get("status") != "unknown" or "rate-limited" not in str(second.get("reason")):
+            raise AutonomousTestError(f"429 hold was not reported as unknown: {second}")
+        if not (state_dir / "claude-usage.hold").exists():
+            raise AutonomousTestError("429 hold file was not written")
+        result.notes.append("HTTP 429 recorded a hold; the next poll did not contact the endpoint.")
+
+    def scenario_claude_hook_installer_temp_merge(self, result: ScenarioResult) -> None:
+        settings = self.run_dir / "claude-installer" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        original = {
+            "env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify.sh"}]}]},
+        }
+        settings.write_text(json.dumps(original, indent=2) + "\n")
+        command = [str(QUOTA_SENTRY), "install-hook", "--provider", "claude",
+                   "--hooks-path", str(settings), "--script-path", str(QUOTA_SENTRY)]
+        self.run(result, command, env=self.env())
+        installed = json.loads(settings.read_text())
+        if installed.get("env") != original["env"] or installed["hooks"].get("Stop") != original["hooks"]["Stop"]:
+            raise AutonomousTestError("installer changed unrelated Claude settings")
+        events = {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+                  "PostToolBatch", "PreCompact"}
+        for event in events:
+            hooks = [hook for entry in installed["hooks"].get(event, []) for hook in entry["hooks"]
+                     if hook.get("command") == str(QUOTA_SENTRY)]
+            if len(hooks) != 1 or hooks[0].get("args", [])[-2:] != ["--provider", "claude"]:
+                raise AutonomousTestError(f"{event} hook missing or wrong: {hooks}")
+            expected_timeout = 30 if event == "SessionStart" else EXPECTED_BLOCKING_HOOK_TIMEOUT_SECONDS
+            if hooks[0].get("timeout") != expected_timeout:
+                raise AutonomousTestError(f"{event} timeout was {hooks[0].get('timeout')}")
+        first = settings.read_bytes()
+        self.run(result, command, env=self.env())
+        if settings.read_bytes() != first:
+            raise AutonomousTestError("second install was not idempotent")
+        if json.loads(Path(str(settings) + ".bak").read_text()) != original:
+            raise AutonomousTestError("backup does not match the original settings")
+        result.notes.append("Installer merged six Claude hooks, kept other settings, backed up, and is idempotent.")
+
+    def scenario_claude_sign_in_renews_expiring_token(self, result: ScenarioResult) -> None:
+        expiring = json.loads(json.dumps(CLAUDE_HARNESS_CREDENTIALS))
+        expiring["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)
+        self.write_claude_login(expiring)
+        try:
+            self.claude_server.set_json(claude_body(30, 20))
+            before = len(self.claude_server.token_requests())
+            state = self.claude_poll(result, self.run_dir / "claude-renewal")
+            renewals = self.claude_server.token_requests()[before:]
+            if state.get("status") != "open":
+                raise AutonomousTestError(f"poll after renewal was not open: {state}")
+            if len(renewals) != 1 or renewals[0].get("grant_type") != "refresh_token":
+                raise AutonomousTestError(f"expected one refresh_token renewal, saw {renewals}")
+            saved = json.loads(self.claude_login.read_text())["claudeAiOauth"]
+            if saved.get("accessToken") != CLAUDE_HARNESS_RENEWED_TOKEN:
+                raise AutonomousTestError("renewed token was not saved")
+            if (self.claude_login.stat().st_mode & 0o777) != 0o600:
+                raise AutonomousTestError("renewed login file is not private")
+            if self.claude_server.last_request().get("authorization") != (
+                    f"Bearer {CLAUDE_HARNESS_RENEWED_TOKEN}"):
+                raise AutonomousTestError("usage read did not use the renewed token")
+            result.notes.append("Expired own sign-in was renewed once, saved 0600, and used for the read.")
+        finally:
+            self.write_claude_login(CLAUDE_HARNESS_CREDENTIALS)
+
+    def scenario_claude_login_stores_private_sign_in(self, result: ScenarioResult) -> None:
+        env = self.claude_env(login="fresh")
+        login_path = Path(env["XDG_CONFIG_HOME"]) / "quota-sentry" / "claude-credentials.json"
+        before = len(self.claude_server.token_requests())
+        process = subprocess.Popen(
+            [str(QUOTA_SENTRY), "login", "--provider", "claude"], cwd=ROOT, env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            url = ""
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not url:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                if line.startswith("https://claude.com/cai/oauth/authorize?"):
+                    url = line.strip()
+            if not url:
+                raise AutonomousTestError("login did not print a sign-in link")
+            from urllib.parse import parse_qs, urlparse
+            state = parse_qs(urlparse(url).query)["state"][0]
+            stdout, stderr = process.communicate(f"harness-code#{state}\n", timeout=15)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        if process.returncode != 0:
+            raise AutonomousTestError(f"login exited {process.returncode}: {stderr!r}")
+        exchanges = self.claude_server.token_requests()[before:]
+        if len(exchanges) != 1 or exchanges[0].get("grant_type") != "authorization_code" \
+                or exchanges[0].get("code") != "harness-code" or not exchanges[0].get("code_verifier"):
+            raise AutonomousTestError(f"unexpected code exchange: {exchanges}")
+        saved = json.loads(login_path.read_text())["claudeAiOauth"]
+        if saved.get("accessToken") != CLAUDE_HARNESS_RENEWED_TOKEN or saved.get("scopes") != ["user:profile"]:
+            raise AutonomousTestError(f"login saved the wrong sign-in: {list(saved)}")
+        if (login_path.stat().st_mode & 0o777) != 0o600:
+            raise AutonomousTestError("login file is not private")
+        if CLAUDE_HARNESS_RENEWED_TOKEN in stdout + stderr:
+            raise AutonomousTestError("login printed a token")
+        result.notes.append("login printed a PKCE link, exchanged the pasted code once, and saved a 0600 file.")
+
+    def scenario_claude_daemon_spaces_reads(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "claude-spacing"
+        env = self.claude_env()
+        self.claude_server.set_json(claude_body(95, 24))
+        self.run(result, [str(QUOTA_SENTRY), "start", "--provider", "claude",
+                          "--state-dir", str(state_dir), "--interval-seconds", "1",
+                          "--near-interval-seconds", "1", "--critical-interval-seconds", "1",
+                          "--min-poll-spacing-seconds", "3"], env=env)
+        try:
+            self.wait_for_status(state_dir, "blocked")
+            first = self.claude_server.request_count()
+            deadline = time.monotonic() + 4.5
+            while time.monotonic() < deadline:
+                (state_dir / "refresh.request").write_text("refresh\n")
+                time.sleep(0.2)
+            reads = self.claude_server.request_count() - first
+            if reads > 2:
+                raise AutonomousTestError(f"daemon read the endpoint {reads} times in 4.5s at 3s spacing")
+            if reads < 1:
+                raise AutonomousTestError("daemon stopped reading the endpoint")
+            result.notes.append(f"Constant refresh requests produced {reads} reads in 4.5s at 3s spacing.")
+        finally:
+            self.run(result, [str(QUOTA_SENTRY), "stop", "--provider", "claude",
+                              "--state-dir", str(state_dir)], env=env)
+
     def run_all(self) -> None:
         self.run_scenario("AT-001", "live Codex quota source smoke", self.scenario_live_quota_source_smoke)
         self.run_scenario("AT-002", "synthetic Codex app-server poll", self.scenario_synthetic_codex_app_server_poll)
@@ -1563,6 +1976,48 @@ print(json.dumps(payload))
             "adaptive daemon cadence and refresh wakeup",
             self.scenario_adaptive_daemon_cadence,
         )
+        self.run_scenario("AT-024", "synthetic Claude usage poll", self.scenario_claude_usage_poll)
+        self.run_scenario(
+            "AT-025",
+            "Claude daemon releases a parked hook only on a fresh reading",
+            self.scenario_claude_daemon_releases_parked_hook,
+        )
+        self.run_scenario(
+            "AT-026",
+            "Claude source failures keep a block and never deny",
+            self.scenario_claude_failures_keep_block_and_never_deny,
+        )
+        self.run_scenario(
+            "AT-027",
+            "Claude weekly hard-block and advisory model windows",
+            self.scenario_claude_weekly_and_advisory_windows,
+        )
+        self.run_scenario(
+            "AT-028",
+            "Claude usage endpoint rate-limit back-off",
+            self.scenario_claude_rate_limit_back_off,
+        )
+        self.run_scenario(
+            "AT-029",
+            "Claude hook installer temp merge",
+            self.scenario_claude_hook_installer_temp_merge,
+        )
+        self.run_scenario(
+            "AT-030",
+            "Claude sign-in renews an expiring token",
+            self.scenario_claude_sign_in_renews_expiring_token,
+        )
+        self.run_scenario(
+            "AT-031",
+            "Claude login command stores a private sign-in",
+            self.scenario_claude_login_stores_private_sign_in,
+        )
+        self.run_scenario(
+            "AT-032",
+            "Claude daemon spaces reads despite refresh requests",
+            self.scenario_claude_daemon_spaces_reads,
+        )
+        self.claude_server.close()
 
     def write_report(self) -> Path:
         report_path = self.run_dir / "report.md"

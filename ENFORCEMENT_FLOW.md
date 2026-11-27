@@ -123,23 +123,24 @@ flowchart LR
   sign-in (PKCE, scope `user:profile`) and stores the result in a file only
   its owner can read. Quota Sentry renews that login itself. It never reads
   the Keychain or Claude Code's own login.
-- **Pacing:** mirrors Claude Code's own handling of this endpoint. The daemon
-  reads at most once per 60 s, even when hooks request an early refresh. HTTP
-  403/429 holds reads for `Retry-After`, or 5 minutes, capped at 1 hour. A
-  rejected or unrenewable sign-in is not retried for 1 hour unless a new
-  `login` replaces it.
+- **Pacing:** the daemon reads at most once per 60 s, even when hooks request
+  an early refresh, and only every 5 minutes while no reading can change the
+  outcome (see Claude Read Pacing below). As in Claude Code, HTTP 403/429 holds
+  reads for `Retry-After`, or 5 minutes, capped at 1 hour. A rejected or
+  unrenewable sign-in is not retried for 1 hour unless a new `login` replaces
+  it.
 
 ### Claude Hook Truth Table
 
 | Claude state | Block remembered? | Hook action | Daemon action | Claude outcome |
 | --- | --- | --- | --- | --- |
-| Fresh `open` | No | Return success | Normal cadence, 60 s minimum spacing | Continue |
+| Fresh `open` | No | Return success | Every 5 minutes; every minute from 85% (5-hour) or 93% (weekly) | Continue |
 | Stale `open` | No | Request refresh, return success | Read once spacing allows | Continue |
 | `unknown`: no sign-in, rejected sign-in, endpoint error or hold | No | Request refresh, return success | Retry at the next allowed read | Continue |
 | Missing or malformed state | No observable block | Request refresh, return success | Rewrite state | Continue |
-| `blocked`: 5h at 90% or more, or weekly at 99% or more | Yes | Wait, re-reading state at most every 30 s | Read at most every 60 s | Wait for a newer reading below threshold |
+| `blocked`: 5h at 90% or more, or weekly at 99% or more | Yes | Wait, re-reading state at most every 30 s | Every 5 minutes until the reported reset, then every minute | Wait for a newer reading below threshold |
 | Blocked, then source failure, stale data or hold | Yes | Keep waiting | Keep the block; retry after the hold | Wait |
-| Blocked, and the reported reset time passes | Yes | Keep waiting | Read again; only a reading below threshold releases | Wait |
+| Blocked, and the reported reset time passes | Yes | Keep waiting | Read every minute; only a reading below threshold releases | Wait |
 | Bypass variable or exempt directory | Either | Return success | None | Continue |
 
 | Hook event | Command | Outcome |
@@ -164,6 +165,65 @@ Known limits:
   you run `login` again.
 - Whether Anthropic accepts a `user:profile`-only sign-in is confirmed only by
   the first real `login`.
+
+## Claude Read Pacing (Approved 2026-11-26)
+
+Approved 2026-11-26 (user reply "Approve"). Claude only. Codex pacing and all
+hooks are unchanged.
+
+Before this change, the Claude daemon read Anthropic's usage endpoint about
+once a minute, all the time. Every Claude reading has a 5-hour window, and any
+reading with a 5-hour window used the 60 s near interval. While a block was
+remembered, waiting hooks also requested a read at every check.
+
+Measured on 2026-11-26:
+
+- A fresh sign-in ran about 4 hours at one read a minute without a 429.
+- After that, a 429 arrived about every 10 minutes. After each 5-minute pause,
+  only about 5 reads got through, so the sustained rate was roughly one read
+  every 2 minutes.
+- A new sign-in kept reading past that point without a 429, which suggests
+  the allowance is per sign-in.
+- Of the day's 311 reads, 234 came during one block, before its reset time,
+  when no reading could release it.
+
+```mermaid
+flowchart LR
+    O1["Open: 5-hour under 85%<br/>and weekly under 93%"] --> S["Every 5 minutes"]
+    B1["Blocked, before the reported reset time<br/>(hook refresh requests add no reads)"] --> S
+    O2["Open: 5-hour at 85% or more,<br/>or weekly at 93% or more"] --> F["Every minute<br/>(as before)"]
+    B2["Blocked, reported reset time passed"] --> F
+    U["Unknown"] --> F
+```
+
+On every path the daemon still reads at most once a minute, and HTTP 403 or 429
+still pauses reads for `Retry-After` or 5 minutes, capped at 1 hour. A blocked
+read is scheduled no later than the reported reset time.
+
+### Before and After, by State
+
+| Claude state | Reads before | Reads now | Hooks |
+| --- | --- | --- | --- |
+| Fresh `open`, 5-hour under 85% and weekly under 93% | Every minute | Every 5 minutes | Continue (unchanged) |
+| Fresh `open`, 5-hour at 85% or more, or weekly at 93% or more | Every minute | Every minute | Continue (unchanged) |
+| Stale `open`, `unknown`, missing, malformed | At the next allowed minute, after any pause | Unchanged | Request refresh, continue (unchanged) |
+| Previously confirmed `blocked`, before the reported reset time | Every minute; waiting hooks kept requesting reads | Every 5 minutes; hook requests add no reads | Wait (unchanged) |
+| Previously confirmed `blocked`, reported reset time passed | Every minute | Every minute, until a newer reading below the threshold releases | Wait (unchanged) |
+| HTTP 403 or 429 | Pause for `Retry-After`, or 5 minutes, at most 1 hour | Unchanged | Unchanged |
+
+No hook event changes. Every Claude event continues or waits as before, and
+none receives a hook denial. A passed reset time still never releases a block;
+it only brings back one read a minute. With several remembered blocks, the
+latest reported reset counts, because usage cannot drop before it.
+
+85% and 93% are the existing near and critical levels. Weekly uses the higher
+one because it climbed about a quarter as fast as the 5-hour window in the
+same minutes (74% to 76% while the 5-hour went from 69% to 78%).
+
+Trade-off: below 85%, the 5-hour window is read every 5 minutes. At the fastest
+climb measured, 69% to 78% in 6 minutes, usage can rise about 7.5 points
+between reads. With a 90% threshold, a block could land about 2 points late. At
+97%, it is unaffected.
 
 ## Mandatory Change Approval Gate
 
@@ -673,6 +733,7 @@ not waive the approval gate for future changes.
 | Isolated admission feasibility spike | Tasks 1-3 `PASS`; Task 4 `REJECTED`; Tasks 5-8 `NOT_RUN (hard stop)` | The original compact turn failed at its four-interval timeout while the front door retained one request; later release could not revive it |
 | Isolated feasibility-spike plan | Approved and executed only as far as the first-non-`PASS` rule permits | `docs/superpowers/plans/2026-09-29-provider-admission-feasibility-spike.md`; controlling evidence is linked from the feasibility report above |
 | Claude Code provider flow | Approved; implemented in the working tree, not yet installed | 2026-11-26: Codex-parity design with Anthropic's usage endpoint as the source ("Yes, use it"); no Keychain access; Quota Sentry's own sign-in file ("Own sign-in file"); pacing added after the user asked for an OAuth rate-limit check |
+| Claude read pacing | Approved; implemented | 2026-11-26: user reply "Approve" to slower reads: every 5 minutes when far from limits or blocked before the reported reset, every minute otherwise; Claude only |
 
 ## Superseded Hook-Only Replacement Flow
 

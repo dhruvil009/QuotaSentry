@@ -641,23 +641,38 @@ def daemon_command(args: argparse.Namespace) -> int:
             )
             persisted_state = core.read_state(state_path)
             print(status_text(persisted_state), flush=True)
-            sleep_seconds = core.next_poll_interval_seconds(
-                decision,
-                base_interval_seconds=args.interval_seconds,
-                near_threshold_percent=args.near_threshold_percent,
-                near_interval_seconds=args.near_interval_seconds,
-                critical_threshold_percent=args.critical_threshold_percent,
-                critical_interval_seconds=args.critical_interval_seconds,
-            )
-            if persisted_state.get("status") != "open":
-                sleep_seconds = min(
-                    sleep_seconds,
-                    max(1, args.critical_interval_seconds),
+            wake_on_refresh = True
+            if provider_of(args) == core.CLAUDE_PROVIDER:
+                sleep_seconds, wake_on_refresh = core.claude_read_plan(
+                    decision,
+                    persisted_state,
+                    now=core.utc_now(),
+                    base_interval_seconds=args.interval_seconds,
+                    near_threshold_percent=args.near_threshold_percent,
+                    near_interval_seconds=args.near_interval_seconds,
+                    critical_threshold_percent=args.critical_threshold_percent,
+                    critical_interval_seconds=args.critical_interval_seconds,
                 )
+            else:
+                sleep_seconds = core.next_poll_interval_seconds(
+                    decision,
+                    base_interval_seconds=args.interval_seconds,
+                    near_threshold_percent=args.near_threshold_percent,
+                    near_interval_seconds=args.near_interval_seconds,
+                    critical_threshold_percent=args.critical_threshold_percent,
+                    critical_interval_seconds=args.critical_interval_seconds,
+                )
+                if persisted_state.get("status") != "open":
+                    sleep_seconds = min(
+                        sleep_seconds,
+                        max(1, args.critical_interval_seconds),
+                    )
             core.consume_refresh_request(refresh_request_path)
             sleep_deadline = time.time() + sleep_seconds
             while keep_running:
-                if core.consume_refresh_request(refresh_request_path):
+                # While blocked before the reset, no reading can release, so
+                # waiting hooks' refresh requests wait for the next scheduled read.
+                if wake_on_refresh and core.consume_refresh_request(refresh_request_path):
                     break
                 remaining = sleep_deadline - time.time()
                 if remaining <= 0:

@@ -2376,6 +2376,51 @@ def next_poll_interval_seconds(
     return effective_base_interval
 
 
+def claude_read_plan(
+    decision: QuotaDecision,
+    state: Dict[str, Any],
+    *,
+    now: datetime,
+    base_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
+    near_threshold_percent: int = DEFAULT_NEAR_THRESHOLD_PERCENT,
+    near_interval_seconds: int = DEFAULT_NEAR_POLL_INTERVAL_SECONDS,
+    critical_threshold_percent: int = DEFAULT_CRITICAL_THRESHOLD_PERCENT,
+    critical_interval_seconds: int = DEFAULT_CRITICAL_POLL_INTERVAL_SECONDS,
+) -> Tuple[int, bool]:
+    """Seconds until the next Claude read, and whether a hook refresh request may cut it short.
+
+    Anthropic's usage endpoint sustains only about one read every 2 minutes, so reads slow
+    down while no reading can change the outcome: far from both limits, or blocked before
+    the reported reset time. Release still needs a newer reading below the threshold.
+    """
+    base = max(1, int(base_interval_seconds))
+    critical = max(1, int(critical_interval_seconds))
+    if state.get("status") == "blocked":
+        resets = [parse_timestamp(window.get("resetsAt"))
+                  for window in _previous_enforcement_windows(state)]
+        if resets and all(reset is not None for reset in resets):
+            # Usage cannot drop before the last remembered block resets.
+            remaining = (max(resets) - now).total_seconds()
+            if remaining > 0:
+                return max(1, min(base, math.ceil(remaining))), False
+        return critical, True
+    if state.get("status") != "open":
+        return critical, True
+    seconds = base
+    for window in decision.quota_windows:
+        if not window.is_default_limit or window.used_percent is None:
+            continue
+        if window.kind == WINDOW_KIND_WEEKLY:
+            # The weekly window climbs far slower, so it speeds reads up only when critical.
+            if decision.weekly_hard_block_enabled and window.used_percent >= critical_threshold_percent:
+                seconds = min(seconds, critical)
+        elif window.used_percent >= critical_threshold_percent:
+            seconds = min(seconds, critical)
+        elif window.used_percent >= near_threshold_percent:
+            seconds = min(seconds, max(1, int(near_interval_seconds)))
+    return seconds, True
+
+
 def wait_if_blocked(
     state_path: Path,
     poller: Callable[[], QuotaDecision],

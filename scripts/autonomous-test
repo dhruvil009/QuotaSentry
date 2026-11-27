@@ -63,6 +63,7 @@ SCENARIOS = [
     ("AT-030", "Claude sign-in renews an expiring token"),
     ("AT-031", "Claude login command stores a private sign-in"),
     ("AT-032", "Claude daemon spaces reads despite refresh requests"),
+    ("AT-033", "Claude daemon reads slowly unless a reading can change the outcome"),
 ]
 
 CLAUDE_HARNESS_TOKEN = "fake-access-token-HARNESS-ONLY"
@@ -1912,6 +1913,51 @@ print(json.dumps(payload))
             self.run(result, [str(QUOTA_SENTRY), "stop", "--provider", "claude",
                               "--state-dir", str(state_dir)], env=env)
 
+    def scenario_claude_daemon_paces_reads(self, result: ScenarioResult) -> None:
+        state_dir = self.run_dir / "claude-pacing"
+        env = self.claude_env()
+        refresh = state_dir / "refresh.request"
+
+        def reads_during(seconds: float, *, request_refresh: bool) -> int:
+            first = self.claude_server.request_count()
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if request_refresh:
+                    refresh.write_text("refresh\n")
+                time.sleep(0.2)
+            return self.claude_server.request_count() - first
+
+        self.claude_server.set_json(claude_body(50, 24))
+        self.run(result, [str(QUOTA_SENTRY), "start", "--provider", "claude",
+                          "--state-dir", str(state_dir), "--interval-seconds", "4",
+                          "--near-interval-seconds", "1", "--critical-interval-seconds", "1",
+                          "--min-poll-spacing-seconds", "1"], env=env)
+        try:
+            self.wait_for_status(state_dir, "open")
+            far = reads_during(5, request_refresh=False)
+            if far > 2:
+                raise AutonomousTestError(f"daemon read {far} times in 5s at 50% with a 4s base interval")
+            self.claude_server.set_json(claude_body(99, 24))
+            refresh.write_text("refresh\n")
+            self.wait_for_status(state_dir, "blocked")
+            blocked = reads_during(5, request_refresh=True)
+            if blocked > 2:
+                raise AutonomousTestError(
+                    f"refresh requests drove {blocked} reads in 5s while blocked before the reset")
+            if blocked < 1:
+                raise AutonomousTestError("daemon stopped reading while blocked")
+            self.claude_server.set_json(claude_body(86, 24))
+            self.wait_for_status(state_dir, "open")
+            near = reads_during(4, request_refresh=False)
+            if near < 3:
+                raise AutonomousTestError(f"daemon read only {near} times in 4s at 86% with a 1s near interval")
+            result.notes.append(
+                f"Reads: {far} in 5s at 50%; {blocked} in 5s while blocked before the reset despite "
+                f"constant refresh requests; {near} in 4s at 86%.")
+        finally:
+            self.run(result, [str(QUOTA_SENTRY), "stop", "--provider", "claude",
+                              "--state-dir", str(state_dir)], env=env)
+
     def run_all(self) -> None:
         self.run_scenario("AT-001", "live Codex quota source smoke", self.scenario_live_quota_source_smoke)
         self.run_scenario("AT-002", "synthetic Codex app-server poll", self.scenario_synthetic_codex_app_server_poll)
@@ -2016,6 +2062,11 @@ print(json.dumps(payload))
             "AT-032",
             "Claude daemon spaces reads despite refresh requests",
             self.scenario_claude_daemon_spaces_reads,
+        )
+        self.run_scenario(
+            "AT-033",
+            "Claude daemon reads slowly unless a reading can change the outcome",
+            self.scenario_claude_daemon_paces_reads,
         )
         self.claude_server.close()
 

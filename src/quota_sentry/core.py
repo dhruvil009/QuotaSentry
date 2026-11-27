@@ -55,6 +55,9 @@ CLAUDE_MIN_POLL_SPACING_SECONDS = 60
 CLAUDE_RATE_LIMIT_HOLD_DEFAULT_SECONDS = 300
 CLAUDE_RATE_LIMIT_HOLD_MAX_SECONDS = 3600
 CLAUDE_AUTH_REJECTED_HOLD_SECONDS = 3600
+# Later in a session the weekly window rose at most 1 point in 5 minutes, so it
+# needs one read a minute only from here up to its 99% block.
+CLAUDE_WEEKLY_MINUTE_READS_PERCENT = 95
 # Claude names its plan windows; the names carry the durations.
 CLAUDE_DEFAULT_WINDOWS = (("five_hour", 300), ("seven_day", 10080))
 WEEKLY_MODE_ADVISORY = "advisory"
@@ -2411,8 +2414,8 @@ def claude_read_plan(
         if not window.is_default_limit or window.used_percent is None:
             continue
         if window.kind == WINDOW_KIND_WEEKLY:
-            # The weekly window climbs far slower, so it speeds reads up only when critical.
-            if decision.weekly_hard_block_enabled and window.used_percent >= critical_threshold_percent:
+            if (decision.weekly_hard_block_enabled
+                    and window.used_percent >= CLAUDE_WEEKLY_MINUTE_READS_PERCENT):
                 seconds = min(seconds, critical)
         elif window.used_percent >= critical_threshold_percent:
             seconds = min(seconds, critical)

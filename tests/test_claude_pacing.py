@@ -55,11 +55,11 @@ class ClaudeReadPlanTest(unittest.TestCase):
     def test_five_hour_from_85_percent_reads_every_minute(self):
         self.assertEqual(self.plan(self.read(85, 50)), (60, True))
 
-    def test_weekly_below_93_percent_stays_slow(self):
-        self.assertEqual(self.plan(self.read(50, 92)), (300, True))
+    def test_weekly_below_95_percent_stays_slow(self):
+        self.assertEqual(self.plan(self.read(50, 94)), (300, True))
 
-    def test_weekly_from_93_percent_reads_every_minute(self):
-        self.assertEqual(self.plan(self.read(50, 93)), (30, True))
+    def test_weekly_from_95_percent_reads_every_minute(self):
+        self.assertEqual(self.plan(self.read(50, 95)), (30, True))
 
     def test_blocked_before_reset_reads_every_five_minutes_and_ignores_hook_requests(self):
         self.assertEqual(self.plan(self.read(95)), (300, False))

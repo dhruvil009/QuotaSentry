@@ -134,7 +134,7 @@ flowchart LR
 
 | Claude state | Block remembered? | Hook action | Daemon action | Claude outcome |
 | --- | --- | --- | --- | --- |
-| Fresh `open` | No | Return success | Every 5 minutes; every minute from 85% (5-hour) or 93% (weekly) | Continue |
+| Fresh `open` | No | Return success | Every 5 minutes; every minute from 85% (5-hour) or 95% (weekly) | Continue |
 | Stale `open` | No | Request refresh, return success | Read once spacing allows | Continue |
 | `unknown`: no sign-in, rejected sign-in, endpoint error or hold | No | Request refresh, return success | Retry at the next allowed read | Continue |
 | Missing or malformed state | No observable block | Request refresh, return success | Rewrite state | Continue |
@@ -169,7 +169,8 @@ Known limits:
 ## Claude Read Pacing (Approved 2026-11-26)
 
 Approved 2026-11-26 (user reply "Approve"). Claude only. Codex pacing and all
-hooks are unchanged.
+hooks are unchanged. Amended 2026-11-27: the weekly window switches to one
+read a minute at 95% instead of 93%.
 
 Before this change, the Claude daemon read Anthropic's usage endpoint about
 once a minute, all the time. Every Claude reading has a 5-hour window, and any
@@ -189,9 +190,9 @@ Measured on 2026-11-26:
 
 ```mermaid
 flowchart LR
-    O1["Open: 5-hour under 85%<br/>and weekly under 93%"] --> S["Every 5 minutes"]
+    O1["Open: 5-hour under 85%<br/>and weekly under 95%"] --> S["Every 5 minutes"]
     B1["Blocked, before the reported reset time<br/>(hook refresh requests add no reads)"] --> S
-    O2["Open: 5-hour at 85% or more,<br/>or weekly at 93% or more"] --> F["Every minute<br/>(as before)"]
+    O2["Open: 5-hour at 85% or more,<br/>or weekly at 95% or more"] --> F["Every minute<br/>(as before)"]
     B2["Blocked, reported reset time passed"] --> F
     U["Unknown"] --> F
 ```
@@ -204,8 +205,8 @@ read is scheduled no later than the reported reset time.
 
 | Claude state | Reads before | Reads now | Hooks |
 | --- | --- | --- | --- |
-| Fresh `open`, 5-hour under 85% and weekly under 93% | Every minute | Every 5 minutes | Continue (unchanged) |
-| Fresh `open`, 5-hour at 85% or more, or weekly at 93% or more | Every minute | Every minute | Continue (unchanged) |
+| Fresh `open`, 5-hour under 85% and weekly under 95% | Every minute | Every 5 minutes | Continue (unchanged) |
+| Fresh `open`, 5-hour at 85% or more, or weekly at 95% or more | Every minute | Every minute | Continue (unchanged) |
 | Stale `open`, `unknown`, missing, malformed | At the next allowed minute, after any pause | Unchanged | Request refresh, continue (unchanged) |
 | Previously confirmed `blocked`, before the reported reset time | Every minute; waiting hooks kept requesting reads | Every 5 minutes; hook requests add no reads | Wait (unchanged) |
 | Previously confirmed `blocked`, reported reset time passed | Every minute | Every minute, until a newer reading below the threshold releases | Wait (unchanged) |
@@ -216,9 +217,11 @@ none receives a hook denial. A passed reset time still never releases a block;
 it only brings back one read a minute. With several remembered blocks, the
 latest reported reset counts, because usage cannot drop before it.
 
-85% and 93% are the existing near and critical levels. Weekly uses the higher
-one because it climbed about a quarter as fast as the 5-hour window in the
-same minutes (74% to 76% while the 5-hour went from 69% to 78%).
+85% is the existing near level. Weekly uses 95%: later in a session, the
+weekly window rose at most 1 point in any 5 minutes (72% to 83% from 22:50 to
+03:55Z), so a 5-minute gap below 95% leaves it well short of the 99% block.
+Climb rates here leave out the first minutes after a 5-hour reset, when
+parked sessions resume together on cold caches.
 
 Trade-off: below 85%, the 5-hour window is read every 5 minutes. At the fastest
 climb measured, 69% to 78% in 6 minutes, usage can rise about 7.5 points
@@ -734,6 +737,7 @@ not waive the approval gate for future changes.
 | Isolated feasibility-spike plan | Approved and executed only as far as the first-non-`PASS` rule permits | `docs/superpowers/plans/2026-09-29-provider-admission-feasibility-spike.md`; controlling evidence is linked from the feasibility report above |
 | Claude Code provider flow | Approved; implemented in the working tree, not yet installed | 2026-11-26: Codex-parity design with Anthropic's usage endpoint as the source ("Yes, use it"); no Keychain access; Quota Sentry's own sign-in file ("Own sign-in file"); pacing added after the user asked for an OAuth rate-limit check |
 | Claude read pacing | Approved; implemented | 2026-11-26: user reply "Approve" to slower reads: every 5 minutes when far from limits or blocked before the reported reset, every minute otherwise; Claude only |
+| Claude weekly minute-read level | Approved; implemented | 2026-11-27: moved from 93% to 95% after the user suggested it ("probably can stretch it to when weekly > 95 or something") and asked to commit and push; later in sessions the weekly window rose at most 1 point in 5 minutes |
 
 ## Superseded Hook-Only Replacement Flow
 

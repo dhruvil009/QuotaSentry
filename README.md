@@ -217,7 +217,7 @@ command takes `--provider claude`, and Claude keeps its own state in
   can stay on. `five_hour` blocks at 90% used and `seven_day` at 99%, under
   the same weekly configuration as Codex. Model-only weekly rows are advisory.
 - **Pacing:** one read every 5 minutes while no reading can change the
-  outcome: the 5-hour window is under 85% and the weekly under 93%, or a block
+  outcome: the 5-hour window is under 85% and the weekly under 95%, or a block
   has not reached its reported reset time. Otherwise one read a minute, which
   is also the most it ever reads, even when waiting hooks ask for a refresh.
   HTTP 403/429 holds reads for `Retry-After`, or 5 minutes, capped at 1 hour.

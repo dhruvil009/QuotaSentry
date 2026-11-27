@@ -6,7 +6,7 @@
 
 > Experimental stock-Codex hook-parking candidate. This checkout adds model-request checkpoints for bounded qualification on Codex 0.168.0; it is not automatically installed in existing sessions and does not provide universal inference admission. No Codex binary modification is required. Hook lifetime, skipped hooks and uncovered internal inference remain limitations.
 
-Quota Sentry is a local circuit breaker for Codex quota. It discovers the quota windows Codex currently exposes, guards short-term and weekly usage, and pauses new Codex activity before you burn through an enforced limit.
+Quota Sentry is a local circuit breaker for Codex and Claude Code quota. It reads the quota windows each tool exposes, guards short-term and weekly usage, and pauses new activity before you burn through an enforced limit.
 
 It is for the moment when a long agent session keeps going, your quota window is nearly spent, and the next prompt or tool call should wait instead of wasting the last few percent.
 
@@ -17,17 +17,17 @@ Quota Sentry: waiting for Codex quota reset until 2026-06-01T21:24:05Z.
 
 ## Why Use It
 
-- Avoid accidentally exhausting a paid or rate-limited Codex window.
-- Keep long-running Codex sessions from starting new work when a short-term quota is already near the threshold.
+- Avoid accidentally exhausting a paid or rate-limited Codex or Claude window.
+- Keep long-running Codex and Claude Code sessions from starting new work when a short-term quota is already near the threshold.
 - Request recovery without rejecting unlatched work when quota data is unknown, stale, or unavailable.
-- Keep a confirmed block latched until Codex reports that policy window below threshold.
-- Keep hooks quiet so Codex does not flood the TUI with guard output after a long wait.
+- Keep a confirmed block latched until the provider reports that policy window below threshold.
+- Keep hooks quiet so neither tool floods its interface with guard output after a long wait.
 
 ## Quick Start
 
 Quota Sentry currently runs from this checkout. Packaging is intentionally not promised until the install path is real.
 
-Requirements: Codex CLI, Python 3.9+, and macOS or Linux. Windows enforcement is not supported in `v0.1.x` because the daemon and state latch require POSIX process and file-locking semantics.
+Requirements: Python 3.9+, macOS or Linux, and Codex CLI or Claude Code. Windows enforcement is not supported because the daemon and state latch require POSIX process and file-locking semantics.
 
 ```bash
 git clone https://github.com/dhruvil009/QuotaSentry.git
@@ -38,6 +38,8 @@ cd QuotaSentry
 ./scripts/quota-sentry start
 ./scripts/quota-sentry install-hook
 ```
+
+For Claude Code, sign in once and add `--provider claude` to each command; see [Claude Code](#claude-code).
 
 Restart every running Codex process after installing or updating hooks. Existing processes keep their previously loaded hook registry.
 
@@ -72,6 +74,8 @@ The daemon polls quota in the background and writes a cached decision. Codex hoo
 
 Once a quota block is confirmed, source failures, malformed sibling windows, stale timestamps, and an expired estimated reset time cannot clear it. Codex must report the same policy window below threshold, or the user must explicitly opt out of that policy.
 
+Claude Code runs through the same daemon, state rules and hook guard, with its own quota source and state directory; see [Claude Code](#claude-code).
+
 ## What It Watches
 
 Codex is the original provider; Claude Code is supported through `--provider claude` (see [Claude Code](#claude-code)). For Codex:
@@ -93,7 +97,7 @@ Codex is the original provider; Claude Code is supported through `--provider cla
 
 Codex may add, remove, or reorder quota windows. `primary` and `secondary` are retained only as source-slot metadata. For example, if Codex temporarily exposes only a weekly window in `primary`, Quota Sentry reports weekly usage and does not reinterpret it as a short-term limit.
 
-The background daemon polls every five minutes when Codex exposes only weekly quota. The presence of any canonical short-term window reduces the baseline to one minute; near-critical usage, source recovery, and durable blocks use at most 30 seconds. Waiting hooks also re-read local state at least every 30 seconds, allowing an ad hoc reset to release without waiting for the original reset estimate.
+For Codex, the background daemon polls every five minutes when Codex exposes only weekly quota. The presence of any canonical short-term window reduces the baseline to one minute; near-critical usage, source recovery, and durable blocks use at most 30 seconds. Waiting hooks also re-read local state at least every 30 seconds, allowing an ad hoc reset to release without waiting for the original reset estimate. Claude pacing is described under [Claude Code](#claude-code).
 
 ## Commands
 
@@ -273,6 +277,8 @@ Files:
 - `recovery.lock`: inherited bootstrap lock and cooldown preventing repeated detached daemon recovery spawns.
 - `quota-sentry.log`: daemon output.
 
+Claude Code state lives in `~/.cache/quota-sentry/claude/` with the same files, plus `claude-usage.hold`, which pauses reads after an HTTP 403/429 or a rejected sign-in. Quota Sentry's Claude sign-in is `~/.config/quota-sentry/claude-credentials.json`, readable only by you.
+
 Hook-mode recovery checks daemon identity and compatibility, then requests a detached bootstrap when needed. The hook does not await the first source poll. Recovery errors cannot clear its retained block or reject an unlatched operation. Installation and daemon rollout remain explicit actions; editing an isolated worktree does not update running sessions.
 
 Config lives at:
@@ -295,7 +301,7 @@ Run autonomous E2E tests:
 ./scripts/autonomous-test
 ```
 
-The autonomous harness runs one live Codex quota-source smoke poll, then uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. Coverage includes weekly-only responses, adaptive short-term polling, daemon refresh wakeups, unlatched source recovery without denial, authoritative reset transitions, backend exhaustion without percentage windows, source-authority downgrade attempts, source failure during a confirmed block, omitted backend fields, canonical-bucket ambiguity, malformed sibling windows, legacy manual watchdog compatibility, and seven-hook configuration. It writes a report under `.quota-sentry-runs/`. These synthetic-source checks are not a substitute for native Codex hook-parking qualification.
+The autonomous harness runs one live Codex quota-source smoke poll, then uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. Coverage includes weekly-only responses, adaptive short-term polling, daemon refresh wakeups, unlatched source recovery without denial, authoritative reset transitions, backend exhaustion without percentage windows, source-authority downgrade attempts, source failure during a confirmed block, omitted backend fields, canonical-bucket ambiguity, malformed sibling windows, legacy manual watchdog compatibility, and seven-hook configuration. Claude scenarios use a loopback stand-in for Anthropic's usage and sign-in endpoints and a harness-only sign-in file, so they never touch a real login. It writes a report under `.quota-sentry-runs/`. These synthetic-source checks are not a substitute for native Codex hook-parking qualification.
 
 For clean clones without installed Codex hooks, the global hook scenario is skipped by default. Use `./scripts/autonomous-test --skip-live --require-global-hook` when you specifically need to verify that this checkout is installed in the active Codex home.
 

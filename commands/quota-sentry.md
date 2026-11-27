@@ -89,3 +89,5 @@ Current hook model:
 - `PreModelRequest` and `PostModelRequest` guard model requests at their lifecycle boundaries.
 
 Installed hook commands consume Codex's JSON stdin immediately. Blocking hooks use a 366-day host timeout, never deny, and return quiet success after a validated release. Killing, disabling, or timing out a hook can still let Codex continue.
+
+For Claude Code, add `--provider claude` to any command above, and run `./scripts/quota-sentry login --provider claude` once first. `install-hook --provider claude` writes to `~/.claude/settings.json`.

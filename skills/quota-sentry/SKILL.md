@@ -1,13 +1,13 @@
 ---
 name: quota-sentry
-description: Use when managing Quota Sentry, checking Codex quota guard state, starting the background quota monitor, or installing the global Codex hook.
+description: Use when managing Quota Sentry, checking Codex or Claude Code quota guard state, starting the background quota monitor, or installing its hooks.
 ---
 
 # Quota Sentry
 
-Quota Sentry is a local Codex quota guard.
+Quota Sentry is a local quota guard for Codex and Claude Code. The behavior below describes Codex; see Claude Code at the end.
 
-Daemon enforcement supports macOS and Linux. Do not install it as an enforcement mechanism on Windows because `v0.1.x` requires POSIX process and file locking.
+Daemon enforcement supports macOS and Linux. Do not install it as an enforcement mechanism on Windows because it requires POSIX process and file locking.
 
 ## Behavior
 
@@ -62,6 +62,10 @@ Do not infer policy from source position. A weekly-only response may legitimatel
 
 `guard` keeps stdout/stderr quiet by default to avoid flooding Codex hook context after long waits. It still writes one wait notice directly to the controlling terminal when waiting starts unless `--no-notify` is set. Use `guard --verbose` only for manual debugging, `guard --no-notify` to suppress the terminal notice, and `guard --state-only` when a hook must not perform a live quota-source poll. Installed blocking hooks allow 366 days and do not use a watchdog denial.
 
+## Claude Code
+
+Every command takes `--provider claude`. Run `./scripts/quota-sentry login --provider claude` once, then `start` and `install-hook` with the same flag; the hooks go into `~/.claude/settings.json`. The README's Claude Code section covers its source, sign-in and read pacing.
+
 ## Bypass
 
-Launch or restart Codex with `QUOTA_SENTRY_DISABLE=1` to bypass blocking.
+Launch or restart Codex or Claude Code with `QUOTA_SENTRY_DISABLE=1` to bypass blocking.

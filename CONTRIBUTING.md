@@ -26,7 +26,7 @@ No package install is required for the core test suite; the project currently us
 
 Codex support uses `codex app-server --stdio` as its authoritative default source and keeps CodexBar only as an explicitly selected compatibility adapter. New harness integrations should be added as isolated adapters, scripts, commands, or plugin surfaces rather than by hardcoding another harness into the Codex path.
 
-When adding support for a harness such as Claude Code or OpenCode:
+When adding support for another harness such as OpenCode:
 
 - Document the harness version, quota source, hook or wrapper entrypoint, and install/uninstall steps.
 - Use structured quota data when available; avoid scraping terminal text unless there is no stable alternative.
@@ -52,7 +52,7 @@ Use the autonomous E2E harness before changing hook behavior, daemon behavior, o
 ./scripts/autonomous-test
 ```
 
-The autonomous harness performs one live Codex quota-source smoke check and uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. If you need to avoid the live check, run:
+The autonomous harness performs one live Codex quota-source smoke check and uses synthetic `codex` and `codexbar` binaries for quota-edge scenarios. Claude scenarios use a loopback stand-in for Anthropic's usage and sign-in endpoints and a harness-only sign-in file. If you need to avoid the live check, run:
 
 ```bash
 ./scripts/autonomous-test --skip-live

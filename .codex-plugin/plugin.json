@@ -1,6 +1,6 @@
 {
   "name": "quota-sentry",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Codex quota guard that classifies short-term and weekly usage windows and waits near reset.",
   "author": {
     "name": "Quota Sentry contributors"

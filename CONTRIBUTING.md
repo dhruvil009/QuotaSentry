@@ -7,7 +7,7 @@ Thanks for improving Quota Sentry. It supports Codex and Claude Code (`--provide
 Quota Sentry should stay small, local, and conservative:
 
 - Avoid wasting paid or rate-limited quota.
-- Fail closed at lifecycle checkpoints when authoritative quota data is missing, malformed, stale, or unavailable.
+- Hold a confirmed block through missing, malformed, stale, or unavailable quota data; without one, request recovery and let work continue.
 - Keep hooks and wrappers quiet unless the user explicitly asks for debug output.
 - Preserve a clear manual bypass for every harness integration.
 - Keep harness-specific behavior isolated so new adapters do not regress Codex.
@@ -17,7 +17,7 @@ Quota Sentry should stay small, local, and conservative:
 Clone the repository, then run commands from the repository root.
 
 ```bash
-PYTHONPATH=src python3 -m unittest tests/test_quota_sentry.py -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 No package install is required for the core test suite; the project currently uses the Python standard library.
@@ -40,10 +40,10 @@ When adding support for a harness such as Claude Code or OpenCode:
 
 ## Testing
 
-Use the focused unit suite for normal development:
+Use the unit suite for normal development:
 
 ```bash
-PYTHONPATH=src python3 -m unittest tests/test_quota_sentry.py -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 Use the autonomous E2E harness before changing hook behavior, daemon behavior, or quota parsing:

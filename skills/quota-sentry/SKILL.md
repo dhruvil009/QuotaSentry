@@ -23,17 +23,17 @@ Daemon enforcement supports macOS and Linux. Do not install it as an enforcement
 - Supports explicit weekly advisory mode as an opt-out from enforcement.
 - Uses `resetsAt` plus a 60-second buffer as an initial wait estimate.
 - Latches a confirmed block until Codex reports that policy window below threshold.
-- Fails closed in installed hooks when source state is unknown, stale, or missing.
+- In installed hooks, holds a confirmed block through unknown, stale, or missing source state; without one, requests daemon recovery and continues.
 
 ## Important Constraint
 
 The background daemon observes quota every five minutes for weekly-only state, every minute when a short-term window is present, and at most every 30 seconds for recovery, near-critical usage, or a retained block. Actual blocking requires a synchronous guard path to run from a global Codex hook or wrapper. Do not claim that the daemon can interrupt an already-running model request.
 
-Installed Codex hooks consume hook stdin immediately and read cached daemon state. `SessionStart` runs `start --quiet` synchronously. `UserPromptSubmit` uses `prompt-guard`; `PreToolUse`, `PostToolUse`, and `PreCompact` use cache-only guards. They preserve a retained block through telemetry failure, but request daemon recovery and continue when stale, unknown, or missing state has no retained block.
+Installed Codex hooks consume hook stdin immediately and read cached daemon state. `SessionStart` runs `start --quiet` synchronously. `UserPromptSubmit` uses `prompt-guard`; `PreToolUse`, `PostToolUse`, `PreCompact`, `PreModelRequest`, and `PostModelRequest` use cache-only guards. They preserve a retained block through telemetry failure, but request daemon recovery and continue when stale, unknown, or missing state has no retained block.
 
 The guard cannot interrupt a model request already in flight, and Codex documents specialized or hosted tool paths as possible exceptions to local tool hooks. Do not claim stronger enforcement than the host lifecycle provides.
 
-A `PostToolUse` denial rejects or replaces the completed tool result but can return feedback to the model. The long host timeout is therefore the primary protection against reaching that fallback during a normal quota block.
+Installed hooks never deny: they wait, then return quiet success after a validated release. The 366-day host timeout is finite, so killing, disabling, skipping, or timing out a hook can let Codex continue.
 
 ## Commands
 
@@ -60,7 +60,7 @@ Weekly usage hard-blocks at `99%` by default without requiring a config file. Us
 
 Do not infer policy from source position. A weekly-only response may legitimately place the seven-day window in `primary`; classify it by its seven-day duration and apply the resolved weekly policy.
 
-`guard` keeps stdout/stderr quiet by default to avoid flooding Codex hook context after long waits. It still writes one wait notice directly to the controlling terminal when waiting starts unless `--no-notify` is set. Use `guard --verbose` only for manual debugging, `guard --no-notify` to suppress the terminal notice, and `guard --state-only` when a hook must not perform a live quota-source poll. Installed blocking hooks allow 366 days and trigger an internal fail-closed watchdog ten minutes before Codex's timeout.
+`guard` keeps stdout/stderr quiet by default to avoid flooding Codex hook context after long waits. It still writes one wait notice directly to the controlling terminal when waiting starts unless `--no-notify` is set. Use `guard --verbose` only for manual debugging, `guard --no-notify` to suppress the terminal notice, and `guard --state-only` when a hook must not perform a live quota-source poll. Installed blocking hooks allow 366 days and do not use a watchdog denial.
 
 ## Bypass
 

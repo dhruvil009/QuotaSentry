@@ -86,5 +86,6 @@ Current hook model:
 - `UserPromptSubmit` runs `prompt-guard`, which starts the daemon quietly when possible, requests recovery for unhealthy cached state, and waits when blocked.
 - `PreToolUse` and `PostToolUse` run cache-only guards around supported local tools.
 - `PreCompact` guards model-backed compaction.
+- `PreModelRequest` and `PostModelRequest` guard model requests at their lifecycle boundaries.
 
-Installed hook commands consume Codex's JSON stdin immediately. Blocking hooks use a 366-day host timeout and an internal watchdog ten minutes earlier so short-term, weekly, and long-lived account blocks do not reach Codex's ordinary timeout and fail open.
+Installed hook commands consume Codex's JSON stdin immediately. Blocking hooks use a 366-day host timeout, never deny, and return quiet success after a validated release. Killing, disabling, or timing out a hook can still let Codex continue.
